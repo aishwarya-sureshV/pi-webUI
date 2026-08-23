@@ -1,0 +1,99 @@
+/* DeepSeek-harness dark theme tokens, transcribed from
+   packages/client/ui-theme/src/styles/design-platform.css (data-ds-dark-theme).
+   Names kept identical so the shell mirrors the reference UI 1:1. */
+:root {
+  --dsw-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --ds-font-family-code: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas,
+    'Liberation Mono', Menlo, Courier, monospace;
+  --ds-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ds-transition-duration: 0.2s;
+  --ds-transition-duration-fast: 0.1s;
+
+  /* neutral-bluish ramp (dark ramp) */
+  --dsw-static-neutral-bluish-00: rgb(255, 255, 255);
+  --dsw-static-neutral-bluish-50: rgb(240, 241, 245);
+  --dsw-static-neutral-bluish-75: rgb(235, 237, 243);
+  --dsw-static-neutral-bluish-100: rgb(229, 231, 235);
+  --dsw-static-neutral-bluish-150: rgb(216, 219, 225);
+  --dsw-static-neutral-bluish-200: rgb(225, 229, 238);
+  --dsw-static-neutral-bluish-300: rgb(199, 204, 214);
+  --dsw-static-neutral-bluish-400: rgb(173, 178, 184);
+  --dsw-static-neutral-bluish-500: rgb(151, 157, 166);
+  --dsw-static-neutral-bluish-600: rgb(123, 129, 137);
+  --dsw-static-neutral-bluish-700: rgb(97, 102, 107);
+  --dsw-static-neutral-bluish-750: rgb(75, 78, 83);
+  --dsw-static-neutral-bluish-800: rgb(53, 54, 56);
+  --dsw-static-neutral-bluish-850: rgb(44, 44, 46);
+  --dsw-static-neutral-bluish-875: rgb(35, 35, 36);
+  --dsw-static-neutral-bluish-900: rgb(27, 27, 28);
+  --dsw-static-neutral-bluish-950: rgb(21, 21, 23);
+  --dsw-static-neutral-bluish-1000: rgb(15, 17, 21);
+}
+
+:root, body[data-ds-dark-theme] {
+  /* aliases actually referenced by the conversation/layout source */
+  --dsw-alias-bg-base: var(--dsw-static-neutral-bluish-950);
+  --dsw-alias-bg-layer-1: var(--dsw-static-neutral-bluish-875);
+  --dsw-alias-bg-layer-2: var(--dsw-static-neutral-bluish-850);
+  --dsw-alias-bg-layer-3: var(--dsw-static-neutral-bluish-900);
+  --dsw-alias-bg-overlay: var(--dsw-static-neutral-bluish-800);
+  --dsw-alias-bg-mask-1: rgba(0, 0, 0, 0.24);
+  --dsw-alias-bg-mask-3: rgba(0, 0, 0, 0.48);
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.06);
+
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.04);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.1);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.12);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.16);
+
+  --dsw-alias-brand-primary: var(--dsw-static-neutral-bluish-50);
+  --dsw-alias-label-primary: var(--dsw-static-neutral-bluish-50);
+  --dsw-alias-label-primary-dimmed: var(--dsw-static-neutral-bluish-100);
+  --dsw-alias-label-secondary: var(--dsw-static-neutral-bluish-300);
+  --dsw-alias-label-caption: var(--dsw-static-neutral-bluish-400);
+  --dsw-alias-label-dimmed: var(--dsw-static-neutral-bluish-200);
+
+  --dsw-alias-button-elevated-fill: var(--dsw-static-neutral-bluish-800);
+  --dsw-alias-button-ghost-active-fill: var(--dsw-static-neutral-bluish-800);
+  --dsw-alias-button-ghost-active-hover: var(--dsw-static-neutral-bluish-750);
+  --dsw-alias-interactive-bg-hover-solid: var(--dsw-static-neutral-bluish-850);
+
+  /* functional accents the reference UI uses for status */
+  --dsw-static-blue-400: rgb(96, 165, 250);
+  --dsw-static-green-400: rgb(74, 222, 128);
+  --dsw-static-red-400: rgb(248, 113, 113);
+  --dsw-static-amber-400: rgb(247, 173, 49);
+
+  --ds-status-success: var(--dsw-static-green-400);
+  --ds-status-error: var(--dsw-static-red-400);
+  --ds-status-warning: var(--dsw-static-amber-400);
+  --ds-activity: var(--dsw-static-blue-400);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--dsw-font-family);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* thin scrollbars like the reference scrollbar.css */
+* { scrollbar-width: thin; scrollbar-color: var(--dsw-alias-border-l3) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--dsw-alias-border-l3); border-radius: 4px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
