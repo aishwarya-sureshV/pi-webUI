@@ -2,12 +2,12 @@
  * Timeline model: converts pi RPC events into renderable items, porting
  * AgentDeck's AgentWorkbench semantics (tool cards, rationale, streaming text).
  */
-import type { AgentEvent, RunStatus, SessionState } from './api'
+import type { AgentEvent, RunStatus, SessionHistoryMessage, SessionState } from './api'
 
 export type TimelineItem =
   | { id: string; kind: 'user'; text: string; timestamp: number }
-  | { id: string; kind: 'rationale'; text: string; live: boolean }
-  | { id: string; kind: 'assistant'; text: string; live: boolean }
+  | { id: string; kind: 'rationale'; text: string; live: boolean; timestamp: number }
+  | { id: string; kind: 'assistant'; text: string; live: boolean; timestamp: number }
   | {
       id: string
       kind: 'tool'
@@ -19,7 +19,7 @@ export type TimelineItem =
       startedAt: number
       elapsed?: number
     }
-  | { id: string; kind: 'notice'; text: string; tone: 'info' | 'warning' | 'error' }
+  | { id: string; kind: 'notice'; text: string; tone: 'info' | 'warning' | 'error'; timestamp: number }
 
 export function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -54,6 +54,24 @@ export function extractText(value: unknown): string {
     .join('\n')
 }
 
+function extractHistoryText(value: unknown, imageLabel = ''): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value
+    .map((part) => {
+      const record = asRecord(part)
+      if (record.type === 'text' && typeof record.text === 'string') return record.text
+      if (imageLabel && record.type === 'image') return imageLabel
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+function historyTimestamp(message: SessionHistoryMessage): number {
+  return typeof message.timestamp === 'number' ? message.timestamp : Date.now()
+}
+
 export class Timeline {
   items: TimelineItem[] = []
   status: RunStatus = 'stopped'
@@ -81,7 +99,7 @@ export class Timeline {
     if (!text) return
     this.updateItems((current) => [
       ...current,
-      { id: crypto.randomUUID(), kind: 'notice', text, tone },
+      { id: crypto.randomUUID(), kind: 'notice', text, tone, timestamp: Date.now() },
     ])
   }
 
@@ -90,6 +108,108 @@ export class Timeline {
       ...current,
       { id: crypto.randomUUID(), kind: 'user', text, timestamp: Date.now() },
     ])
+  }
+
+  reset(state: SessionState | null = this.state) {
+    this.items = []
+    this.streams.clear()
+    this.cycle = 0
+    this.state = state
+    this.status = state?.isStreaming ? 'working' : 'ready'
+    this.notify()
+  }
+
+  hydrate(messages: SessionHistoryMessage[], state: SessionState) {
+    const items: TimelineItem[] = []
+    const tools = new Map<string, number>()
+
+    messages.forEach((message, messageIndex) => {
+      const role = String(message.role ?? '')
+      const timestamp = historyTimestamp(message)
+      if (role === 'user') {
+        const text = extractHistoryText(message.content, '[Image attachment]')
+        if (text) items.push({ id: `history-user-${messageIndex}`, kind: 'user', text, timestamp })
+        return
+      }
+
+      if (role === 'assistant') {
+        const error = readableAgentError(message.errorMessage)
+        if (error) {
+          items.push({ id: `history-error-${messageIndex}`, kind: 'notice', text: error, tone: 'error', timestamp })
+        }
+        if (!Array.isArray(message.content)) return
+        message.content.forEach((part, contentIndex) => {
+          const content = asRecord(part)
+          const type = String(content.type ?? '')
+          if (type === 'thinking') {
+            const text = typeof content.thinking === 'string' ? content.thinking : ''
+            if (text) items.push({ id: `history-rationale-${messageIndex}-${contentIndex}`, kind: 'rationale', text, live: false, timestamp })
+          } else if (type === 'text') {
+            const text = typeof content.text === 'string' ? content.text : ''
+            if (text) items.push({ id: `history-assistant-${messageIndex}-${contentIndex}`, kind: 'assistant', text, live: false, timestamp })
+          } else if (type === 'toolCall') {
+            const id = String(content.id ?? `history-tool-${messageIndex}-${contentIndex}`)
+            const tool: TimelineItem = {
+              id,
+              kind: 'tool',
+              name: String(content.name ?? 'tool'),
+              args: asRecord(content.arguments),
+              details: {},
+              output: '',
+              status: 'running',
+              startedAt: timestamp,
+            }
+            tools.set(id, items.length)
+            items.push(tool)
+          }
+        })
+        return
+      }
+
+      if (role === 'toolResult') {
+        const id = String(message.toolCallId ?? '')
+        const output = extractHistoryText(message.content, '[Image output]')
+        const found = tools.get(id)
+        if (found !== undefined) {
+          const tool = items[found]
+          if (tool?.kind === 'tool') {
+            items[found] = {
+              ...tool,
+              name: String(message.toolName ?? tool.name),
+              details: asRecord(message.details),
+              output,
+              status: message.isError ? 'error' : 'done',
+              elapsed: Math.max(0, timestamp - tool.startedAt),
+            }
+          }
+        } else {
+          items.push({
+            id: id || `history-tool-result-${messageIndex}`,
+            kind: 'tool',
+            name: String(message.toolName ?? 'tool'),
+            args: {},
+            details: asRecord(message.details),
+            output,
+            status: message.isError ? 'error' : 'done',
+            startedAt: timestamp,
+            elapsed: 0,
+          })
+        }
+      }
+    })
+
+    this.items = items
+    this.streams.clear()
+    this.cycle = 0
+    this.state = state
+    this.status = state.isStreaming ? 'working' : 'ready'
+    this.notify()
+  }
+
+  setState(state: SessionState) {
+    this.state = state
+    this.status = state.isStreaming ? 'working' : 'ready'
+    this.notify()
   }
 
   private upsertStream(id: string, kind: 'rationale' | 'assistant', text: string, final?: string) {
@@ -117,7 +237,7 @@ export class Timeline {
         if (!text) continue
         const found = next.findIndex((item) => item.id === patch.id)
         if (found === -1) {
-          next = [...next, { id: patch.id, kind: patch.kind, text, live: !done }]
+          next = [...next, { id: patch.id, kind: patch.kind, text, live: !done, timestamp: Date.now() }]
         } else {
           next = next.map((item, index) =>
             index === found && (item.kind === 'rationale' || item.kind === 'assistant')
@@ -149,6 +269,13 @@ export class Timeline {
     }
     if (event.type === 'turn_start') { this.cycle += 1; return }
 
+    if (event.type === 'agent_start') {
+      this.status = 'working'
+      if (this.state) this.state = { ...this.state, isStreaming: true }
+      this.notify()
+      return
+    }
+
     if (event.type === 'message_update') {
       const update = asRecord(event.assistantMessageEvent)
       const contentIndex = typeof update.contentIndex === 'number' ? update.contentIndex : 0
@@ -175,6 +302,7 @@ export class Timeline {
       // Authoritative final text: if deltas were suppressed (retries / exhausted
       // accounts), message_end still carries the whole assistant message.
       const finalText = extractText(message.content)
+      const finalTimestamp = historyTimestamp(message)
       if (finalText) {
         // Deltas may have already rendered this exact text at any content index
         // this cycle; only fall back to message_end when nothing matches.
@@ -182,6 +310,11 @@ export class Timeline {
           (item) => item.kind === 'assistant' && item.id.startsWith(`assistant-${this.cycle}-`) && item.text.trim() === finalText.trim(),
         )
         if (!already) this.upsertStream(`assistant-${this.cycle}-0`, 'assistant', '', finalText)
+        this.updateItems((current) => current.map((item) =>
+          item.kind === 'assistant' && item.id.startsWith(`assistant-${this.cycle}-`)
+            ? { ...item, timestamp: finalTimestamp }
+            : item,
+        ))
       }
       return
     }
@@ -229,8 +362,7 @@ export class Timeline {
     }
 
     if (event.type === 'state') {
-      this.state = event.state as SessionState
-      this.notify()
+      this.setState(event.state as SessionState)
       return
     }
   }

@@ -1,99 +1,175 @@
-/* DeepSeek-harness dark theme tokens, transcribed from
-   packages/client/ui-theme/src/styles/design-platform.css (data-ds-dark-theme).
-   Names kept identical so the shell mirrors the reference UI 1:1. */
+/* Terminal Agent UI reference palette. The application keeps its existing
+   semantic token names while both appearances use the supplied literal colors. */
 :root {
-  --dsw-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-  --ds-font-family-code: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas,
-    'Liberation Mono', Menlo, Courier, monospace;
+  --dsw-font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  --ds-font-family-code: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
   --ds-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
   --ds-transition-duration: 0.2s;
   --ds-transition-duration-fast: 0.1s;
+  --ds-transition-duration-slow: 0.3s;
 
-  /* neutral-bluish ramp (dark ramp) */
-  --dsw-static-neutral-bluish-00: rgb(255, 255, 255);
-  --dsw-static-neutral-bluish-50: rgb(240, 241, 245);
-  --dsw-static-neutral-bluish-75: rgb(235, 237, 243);
-  --dsw-static-neutral-bluish-100: rgb(229, 231, 235);
-  --dsw-static-neutral-bluish-150: rgb(216, 219, 225);
-  --dsw-static-neutral-bluish-200: rgb(225, 229, 238);
-  --dsw-static-neutral-bluish-300: rgb(199, 204, 214);
-  --dsw-static-neutral-bluish-400: rgb(173, 178, 184);
-  --dsw-static-neutral-bluish-500: rgb(151, 157, 166);
-  --dsw-static-neutral-bluish-600: rgb(123, 129, 137);
-  --dsw-static-neutral-bluish-700: rgb(97, 102, 107);
-  --dsw-static-neutral-bluish-750: rgb(75, 78, 83);
-  --dsw-static-neutral-bluish-800: rgb(53, 54, 56);
-  --dsw-static-neutral-bluish-850: rgb(44, 44, 46);
-  --dsw-static-neutral-bluish-875: rgb(35, 35, 36);
-  --dsw-static-neutral-bluish-900: rgb(27, 27, 28);
-  --dsw-static-neutral-bluish-950: rgb(21, 21, 23);
-  --dsw-static-neutral-bluish-1000: rgb(15, 17, 21);
+  --pw-panel: #ebe6da;
+  --pw-rail: #efebe1;
+  --pw-card: #fbf9f3;
+  --pw-card-strong: #fffdf7;
+  --pw-fg: #231f19;
+  --pw-fg-2: #3c362d;
+  --pw-fg-3: #6b6355;
+  --pw-fg-4: #8c8375;
+  --pw-fg-5: #a39a8b;
+  --pw-accent: #b05d13;
+  --pw-accent-dim: #9c7a51;
+  --pw-accent-tint: rgba(176, 93, 19, 0.07);
+  --pw-accent-tint-2: rgba(176, 93, 19, 0.13);
+  --pw-accent-line: rgba(176, 93, 19, 0.25);
+  --pw-teal: #1f6f6a;
+  --pw-teal-tint: rgba(31, 111, 106, 0.07);
+  --pw-teal-line: rgba(31, 111, 106, 0.22);
+  --pw-green: #3f6f39;
+  --pw-red: #a4392e;
+  --pw-yellow: #846214;
+  --pw-user-bg: #fcf5e6;
+  --pw-code: #4a4437;
+  --pw-stripe: rgba(38, 32, 24, 0.09);
+  --pw-add-bg: rgba(63, 111, 57, 0.10);
+  --pw-add-fg: #33602e;
+  --pw-del-bg: rgba(164, 57, 46, 0.09);
+  --pw-del-fg: #8d3a30;
+
+  --dsw-alias-bg-base: #f4f1e9;
+  --dsw-alias-bg-layer-1: var(--pw-card);
+  --dsw-alias-bg-layer-2: var(--pw-card-strong);
+  --dsw-alias-bg-layer-3: var(--pw-panel);
+  --dsw-alias-bg-overlay: var(--pw-card-strong);
+  --dsw-alias-bg-mask-3: rgba(38, 32, 24, 0.48);
+  --dsw-alias-bg-skeleton: rgba(38, 32, 24, 0.04);
+  --dsw-alias-border-l1: rgba(38, 32, 24, 0.07);
+  --dsw-alias-border-l2: rgba(38, 32, 24, 0.10);
+  --dsw-alias-border-l2-darkmode-thin: rgba(38, 32, 24, 0.10);
+  --dsw-alias-border-l3: rgba(38, 32, 24, 0.17);
+  --dsw-alias-border-l4: rgba(38, 32, 24, 0.22);
+  --dsw-alias-brand-primary: var(--pw-fg);
+  --dsw-alias-label-primary: var(--pw-fg);
+  --dsw-alias-label-primary-dimmed: var(--pw-fg-2);
+  --dsw-alias-label-secondary: var(--pw-fg-3);
+  --dsw-alias-label-caption: var(--pw-fg-4);
+  --dsw-alias-label-dimmed: var(--pw-fg-5);
+  --dsw-alias-label-primary-accent: var(--pw-accent);
+  --dsw-alias-label-primary-inverted: var(--pw-card-strong);
+  --dsw-alias-label-tertiary: var(--pw-fg-4);
+  --dsw-alias-interactive-bg-hover: var(--pw-accent-tint);
+  --dsw-alias-interactive-bg-hover-solid: #f3ede0;
+  --dsw-alias-button-elevated-fill: var(--pw-card-strong);
+  --dsw-alias-button-floating-hover: #f3ede0;
+  --dsw-alias-button-ghost-active-fill: var(--pw-accent-tint);
+  --dsw-alias-button-ghost-active-hover: var(--pw-accent-tint-2);
+  --dsw-alias-state-business-primary: var(--pw-accent);
+  --dsw-alias-state-business-tertiary: var(--pw-accent-tint-2);
+  --dsw-alias-state-error-primary: var(--pw-red);
+  --dsw-specific-input-major: var(--pw-card-strong);
+  --dsw-specific-selector: var(--pw-card);
+  --dsw-specific-bubble: var(--pw-user-bg);
+  --dsw-specific-user-accent: var(--pw-accent);
+  --dsw-specific-sidebar-fill: var(--pw-rail);
+  --dsw-specific-sidebar-nav-item-active: var(--pw-accent-tint-2);
+  --dsw-specific-sidebar-nav-item-hover: var(--pw-accent-tint);
+  --ds-status-success: var(--pw-green);
+  --ds-status-error: var(--pw-red);
+  --ds-status-warning: var(--pw-yellow);
+  --ds-activity: var(--pw-accent);
+  --dsw-shadow-lv2: 0 4px 14px rgba(38, 32, 24, 0.06);
 }
 
-:root, body[data-ds-dark-theme] {
-  /* aliases actually referenced by the conversation/layout source */
-  --dsw-alias-bg-base: var(--dsw-static-neutral-bluish-950);
-  --dsw-alias-bg-layer-1: var(--dsw-static-neutral-bluish-875);
-  --dsw-alias-bg-layer-2: var(--dsw-static-neutral-bluish-850);
-  --dsw-alias-bg-layer-3: var(--dsw-static-neutral-bluish-900);
-  --dsw-alias-bg-overlay: var(--dsw-static-neutral-bluish-800);
-  --dsw-alias-bg-mask-1: rgba(0, 0, 0, 0.24);
-  --dsw-alias-bg-mask-3: rgba(0, 0, 0, 0.48);
-  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.06);
+/* ---- DARK ---- */
+body[data-ds-dark-theme] {
+  color-scheme: dark;
+  --pw-panel: #12110f;
+  --pw-rail: #100f0d;
+  --pw-card: #131210;
+  --pw-card-strong: #16150f;
+  --pw-fg: #f0ebe2;
+  --pw-fg-2: #d6cfc4;
+  --pw-fg-3: #9a9189;
+  --pw-fg-4: #6d655c;
+  --pw-fg-5: #55504a;
+  --pw-accent: #e8a765;
+  --pw-accent-dim: #8b7358;
+  --pw-accent-tint: rgba(232, 167, 101, 0.07);
+  --pw-accent-tint-2: rgba(232, 167, 101, 0.13);
+  --pw-accent-line: rgba(232, 167, 101, 0.22);
+  --pw-teal: #7cc7c0;
+  --pw-teal-tint: rgba(124, 199, 192, 0.07);
+  --pw-teal-line: rgba(124, 199, 192, 0.20);
+  --pw-green: #86b784;
+  --pw-red: #d4796f;
+  --pw-yellow: #d9b972;
+  --pw-user-bg: #17150f;
+  --pw-code: #a8a099;
+  --pw-stripe: rgba(255, 255, 255, 0.07);
+  --pw-add-bg: rgba(134, 183, 132, 0.09);
+  --pw-add-fg: #cfe0ce;
+  --pw-del-bg: rgba(212, 121, 111, 0.08);
+  --pw-del-fg: #c9938c;
 
-  --dsw-alias-border-l1: rgba(255, 255, 255, 0.04);
-  --dsw-alias-border-l2: rgba(255, 255, 255, 0.1);
-  --dsw-alias-border-l3: rgba(255, 255, 255, 0.12);
-  --dsw-alias-border-l4: rgba(255, 255, 255, 0.16);
-
-  --dsw-alias-brand-primary: var(--dsw-static-neutral-bluish-50);
-  --dsw-alias-label-primary: var(--dsw-static-neutral-bluish-50);
-  --dsw-alias-label-primary-dimmed: var(--dsw-static-neutral-bluish-100);
-  --dsw-alias-label-secondary: var(--dsw-static-neutral-bluish-300);
-  --dsw-alias-label-caption: var(--dsw-static-neutral-bluish-400);
-  --dsw-alias-label-dimmed: var(--dsw-static-neutral-bluish-200);
-
-  --dsw-alias-button-elevated-fill: var(--dsw-static-neutral-bluish-800);
-  --dsw-alias-button-ghost-active-fill: var(--dsw-static-neutral-bluish-800);
-  --dsw-alias-button-ghost-active-hover: var(--dsw-static-neutral-bluish-750);
-  --dsw-alias-interactive-bg-hover-solid: var(--dsw-static-neutral-bluish-850);
-
-  /* functional accents the reference UI uses for status */
-  --dsw-static-blue-400: rgb(96, 165, 250);
-  --dsw-static-green-400: rgb(74, 222, 128);
-  --dsw-static-red-400: rgb(248, 113, 113);
-  --dsw-static-amber-400: rgb(247, 173, 49);
-
-  --ds-status-success: var(--dsw-static-green-400);
-  --ds-status-error: var(--dsw-static-red-400);
-  --ds-status-warning: var(--dsw-static-amber-400);
-  --ds-activity: var(--dsw-static-blue-400);
+  --dsw-alias-bg-base: #0e0d0b;
+  --dsw-alias-bg-layer-1: var(--pw-card);
+  --dsw-alias-bg-layer-2: var(--pw-card-strong);
+  --dsw-alias-bg-layer-3: var(--pw-panel);
+  --dsw-alias-bg-overlay: var(--pw-card-strong);
+  --dsw-alias-bg-skeleton: rgba(255, 255, 255, 0.08);
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.07);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.07);
+  --dsw-alias-border-l2-darkmode-thin: rgba(255, 255, 255, 0.07);
+  --dsw-alias-border-l3: rgba(255, 255, 255, 0.13);
+  --dsw-alias-border-l4: rgba(255, 255, 255, 0.18);
+  --dsw-alias-brand-primary: var(--pw-fg);
+  --dsw-alias-label-primary: var(--pw-fg);
+  --dsw-alias-label-primary-dimmed: var(--pw-fg-2);
+  --dsw-alias-label-primary-inverted: #0e0d0b;
+  --dsw-alias-label-primary-accent: var(--pw-accent);
+  --dsw-alias-label-secondary: var(--pw-fg-3);
+  --dsw-alias-label-tertiary: var(--pw-fg-4);
+  --dsw-alias-label-caption: var(--pw-fg-4);
+  --dsw-alias-label-dimmed: var(--pw-fg-5);
+  --dsw-alias-interactive-bg-hover: var(--pw-accent-tint);
+  --dsw-alias-interactive-bg-hover-solid: #1b1915;
+  --dsw-alias-button-elevated-fill: var(--pw-card-strong);
+  --dsw-alias-button-floating-hover: #1b1915;
+  --dsw-alias-button-ghost-active-fill: var(--pw-accent-tint);
+  --dsw-alias-button-ghost-active-hover: var(--pw-accent-tint-2);
+  --dsw-alias-state-business-primary: var(--pw-accent);
+  --dsw-alias-state-business-tertiary: var(--pw-accent-tint-2);
+  --dsw-alias-state-error-primary: var(--pw-red);
+  --dsw-specific-input-major: var(--pw-card-strong);
+  --dsw-specific-selector: var(--pw-card);
+  --dsw-specific-bubble: var(--pw-user-bg);
+  --dsw-specific-user-accent: var(--pw-accent);
+  --dsw-specific-sidebar-fill: var(--pw-rail);
+  --dsw-specific-sidebar-nav-item-active: var(--pw-accent-tint-2);
+  --dsw-specific-sidebar-nav-item-hover: var(--pw-accent-tint);
+  --ds-status-success: var(--pw-green);
+  --ds-status-error: var(--pw-red);
+  --ds-status-warning: var(--pw-yellow);
+  --ds-activity: var(--pw-accent);
+  --dsw-shadow-lv2: 0 10px 28px -14px rgba(0, 0, 0, 0.8);
 }
 
 * { box-sizing: border-box; }
 
-html, body, #root {
-  height: 100%;
-  margin: 0;
-}
+html, body, #root { height: 100%; margin: 0; }
 
 body {
   font-family: var(--dsw-font-family);
   background: var(--dsw-alias-bg-base);
   color: var(--dsw-alias-label-primary);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
 
-/* thin scrollbars like the reference scrollbar.css */
 * { scrollbar-width: thin; scrollbar-color: var(--dsw-alias-border-l3) transparent; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-thumb { background: var(--dsw-alias-border-l3); border-radius: 4px; }
 *::-webkit-scrollbar-track { background: transparent; }
 
-button {
-  font-family: inherit;
-  cursor: pointer;
-}
+button { font-family: inherit; cursor: pointer; }

@@ -7,6 +7,8 @@
  * and `switch_session` rebind the process to a fresh conversation.
  */
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { StringDecoder } from 'node:string_decoder'
 
 const CO_PARTNER_PROMPT = [
@@ -19,6 +21,17 @@ const CO_PARTNER_PROMPT = [
   'expected evidence). After tools run, briefly note how the evidence changed the conclusion.',
   'Use plain language and stay terse throughout.',
 ].join(' ')
+
+const PLAN_MODE_PROMPT = [
+  'You are in plan mode, a strictly read-only exploration phase.',
+  'Inspect the workspace with the available read-only tools, ask concise clarifying questions when needed,',
+  'and do not attempt to edit, write, install, or otherwise change files or external state.',
+  'Finish with a detailed numbered implementation plan under an exact "Plan:" heading:',
+  'Plan:',
+  '1. First step description',
+  '2. Second step description',
+  'Do not execute the plan until the user explicitly chooses Execute plan in the interface.',
+].join('\n')
 
 function resolvePiExecutable() {
   return process.env.PI_WEB_PI_BIN || 'pi'
@@ -53,14 +66,32 @@ class PiAgentProcess {
     this.emit({ type: '__status', sessionKey: this.sessionKey, status, ...(error ? { error } : {}) })
   }
 
-  async start(cwd) {
+  async start(cwd, options = {}) {
+    // A bogus cwd surfaces as a confusing 'spawn pi ENOENT' (Node reports the
+    // same errno for a missing working directory as for a missing binary).
+    // Fall back to $HOME and tell the UI.
+    if (cwd && !existsSync(cwd)) {
+      this.emit({ type: '__status', sessionKey: this.sessionKey, status: this.status })
+      cwd = homedir()
+      queueMicrotask(() => this.emit({ type: 'stderr', sessionKey: this.sessionKey,
+        message: `cwd not found; opened in ${cwd} instead` }))
+    }
     if (this.process) {
       try { return { ok: true, state: await this.getState() } }
       catch (error) { return { ok: false, error: String(error?.message ?? error) } }
     }
     this.setStatus('starting')
     this.stdoutBuffer = ''
-    const args = ['--mode', 'rpc', '--approve', '--append-system-prompt', CO_PARTNER_PROMPT]
+    const systemPrompt = options.agentMode === 'plan'
+      ? `${CO_PARTNER_PROMPT}\n\n${PLAN_MODE_PROMPT}`
+      : CO_PARTNER_PROMPT
+    const args = ['--mode', 'rpc', '--approve', '--append-system-prompt', systemPrompt]
+    if (options.accessMode === 'read-only' || options.agentMode === 'plan') {
+      args.push('--tools', 'read,grep,find,ls')
+    }
+    if (options.sessionPath) args.push('--session', options.sessionPath)
+    if (options.model?.provider && options.model?.id) args.push('--provider', options.model.provider, '--model', options.model.id)
+    if (options.thinkingLevel) args.push('--thinking', options.thinkingLevel)
     const child = spawn(resolvePiExecutable(), args, {
       cwd,
       env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -95,16 +126,24 @@ class PiAgentProcess {
     return { ok: true, state }
   }
 
-  prompt(message) { return this.runCommand({ type: 'prompt', message }) }
-  steer(message) { return this.runCommand({ type: 'steer', message }) }
-  followUp(message) { return this.runCommand({ type: 'follow_up', message }) }
+  prompt(message, images) { return this.runCommand({ type: 'prompt', message, ...(images?.length ? { images } : {}) }) }
+  steer(message, images) { return this.runCommand({ type: 'steer', message, ...(images?.length ? { images } : {}) }) }
+  followUp(message, images) { return this.runCommand({ type: 'follow_up', message, ...(images?.length ? { images } : {}) }) }
   abort() { return this.runCommand({ type: 'abort' }) }
-  newSession() { return this.runCommand({ type: 'new_session' }) }
-  switchSession(sessionPath) { return this.runCommand({ type: 'switch_session', sessionPath }) }
+  newSession() { return this.runSessionCommand({ type: 'new_session' }) }
+  switchSession(sessionPath) { return this.runSessionCommand({ type: 'switch_session', sessionPath }) }
   compact(customInstructions) {
     return this.runCommand({ type: 'compact', ...(customInstructions ? { customInstructions } : {}) })
   }
-  setModel(provider, modelId) { return this.runCommand({ type: 'set_model', provider, modelId }) }
+  async setModel(provider, modelId) {
+    const result = await this.runCommand({ type: 'set_model', provider, modelId })
+    if (!result.ok) return result
+    try {
+      return { ok: true, data: result.data, state: await this.getState() }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) }
+    }
+  }
   setThinkingLevel(level) { return this.runCommand({ type: 'set_thinking_level', level }) }
 
   async getState() {
@@ -113,25 +152,74 @@ class PiAgentProcess {
     return response.data
   }
 
+  async getMessages() {
+    const response = await this.send({ type: 'get_messages' })
+    if (response.success === false) throw new Error(response.error ?? 'get_messages failed')
+    const data = response.data
+    return Array.isArray(data) ? data : (data?.messages ?? [])
+  }
+
+  async getEntries() {
+    const response = await this.send({ type: 'get_entries' })
+    if (response.success === false) throw new Error(response.error ?? 'get_entries failed')
+    const data = response.data
+    return Array.isArray(data) ? data : (data?.entries ?? [])
+  }
+
+  async forkAt(timestamp) {
+    const entries = await this.getEntries()
+    const assistantEntries = entries.filter((entry) =>
+      entry?.type === 'message' && entry?.message?.role === 'assistant' && entry?.id,
+    )
+    if (assistantEntries.length === 0) return { ok: false, error: 'No assistant response is available to fork.' }
+    const requested = Number(timestamp)
+    const entry = Number.isFinite(requested)
+      ? assistantEntries.reduce((closest, candidate) => {
+          const closestTime = Number(closest?.message?.timestamp ?? Date.parse(closest?.timestamp ?? ''))
+          const candidateTime = Number(candidate?.message?.timestamp ?? Date.parse(candidate?.timestamp ?? ''))
+          return Math.abs(candidateTime - requested) < Math.abs(closestTime - requested) ? candidate : closest
+        })
+      : assistantEntries.at(-1)
+    const entryIndex = entries.findIndex((candidate) => candidate?.id === entry?.id)
+    const nextUser = entries.slice(entryIndex + 1).find((candidate) =>
+      candidate?.type === 'message' && candidate?.message?.role === 'user' && candidate?.id,
+    )
+    return nextUser
+      ? this.runSessionCommand({ type: 'fork', entryId: nextUser.id })
+      : this.runSessionCommand({ type: 'clone' })
+  }
+
+  async runSessionCommand(command) {
+    const result = await this.runCommand(command)
+    if (!result.ok) return result
+    try {
+      const [state, messages] = await Promise.all([this.getState(), this.getMessages()])
+      return { ok: true, state, messages, data: result.data }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) }
+    }
+  }
+
+  // pi answers these with envelopes like { models: [...] } — unwrap to arrays.
   async getCommands() {
     const response = await this.send({ type: 'get_commands' })
-    return response.success === false
-      ? { ok: false, error: response.error ?? 'failed' }
-      : { ok: true, commands: response.data ?? [] }
+    if (response.success === false) return { ok: false, error: response.error ?? 'failed' }
+    const data = response.data
+    return { ok: true, commands: Array.isArray(data) ? data : (data?.commands ?? []) }
   }
 
   async getAvailableModels() {
     const response = await this.send({ type: 'get_available_models' })
-    return response.success === false
-      ? { ok: false, error: response.error ?? 'failed' }
-      : { ok: true, models: response.data ?? [] }
+    if (response.success === false) return { ok: false, error: response.error ?? 'failed' }
+    const data = response.data
+    return { ok: true, models: Array.isArray(data) ? data : (data?.models ?? []) }
   }
 
   async getThinkingLevels() {
     const response = await this.send({ type: 'get_available_thinking_levels' })
-    return response.success === false
-      ? { ok: false, error: response.error ?? 'failed' }
-      : { ok: true, levels: response.data ?? [] }
+    if (response.success === false) return { ok: false, error: response.error ?? 'failed' }
+    const data = response.data
+    return { ok: true, levels: Array.isArray(data) ? data : (data?.levels ?? []) }
   }
 
   async runCommand(command) {
@@ -185,6 +273,13 @@ class PiAgentProcess {
       this.pending.delete(event.id)
       resolve(event)
       return
+    }
+    if (event.type === 'agent_start') this.setStatus('working')
+    if (event.type === 'agent_settled') {
+      this.setStatus('ready')
+      void this.getState()
+        .then((state) => this.emit({ type: 'state', sessionKey: this.sessionKey, state }))
+        .catch(() => {})
     }
     this.emit({ ...event, sessionKey: this.sessionKey })
   }

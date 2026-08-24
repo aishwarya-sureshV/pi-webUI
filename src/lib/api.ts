@@ -36,6 +36,84 @@ export interface SlashCommand {
   argumentHint?: string
 }
 
+export interface ImageAttachment {
+  type: 'image'
+  data: string
+  mimeType: string
+}
+
+export interface SessionHistoryMessage {
+  role?: string
+  content?: unknown
+  timestamp?: number
+  toolCallId?: string
+  toolName?: string
+  details?: unknown
+  isError?: boolean
+  errorMessage?: string
+  stopReason?: string
+  [key: string]: unknown
+}
+
+export interface SessionSnapshotResponse {
+  ok: boolean
+  state?: SessionState
+  messages?: SessionHistoryMessage[]
+  error?: string
+}
+
+export interface SessionMutationResponse {
+  ok: boolean
+  error?: string
+}
+
+export interface DirectoryEntry {
+  name: string
+  path: string
+  hidden: boolean
+}
+
+export interface DirectoryListingResponse {
+  ok: boolean
+  path?: string
+  parent?: string | null
+  home?: string
+  entries?: DirectoryEntry[]
+  error?: string
+}
+
+export interface PiSkillInfo {
+  name: string
+  description: string
+  path: string
+}
+
+export interface PiExtensionInfo {
+  name: string
+  version: string
+  description: string
+  source: string
+  spec: string
+  path: string
+}
+
+export interface PiCatalogResponse {
+  ok: boolean
+  skills: PiSkillInfo[]
+  extensions: PiExtensionInfo[]
+  settings: {
+    defaultProvider?: string
+    defaultModel?: string
+    defaultThinkingLevel?: string
+    theme?: string
+    quietStartup?: boolean
+    hideThinkingBlock?: boolean
+    themeCount?: number
+    path?: string
+  }
+  error?: string
+}
+
 export interface AgentEvent {
   type: string
   sessionKey?: string
@@ -57,24 +135,56 @@ async function get<T = unknown>(url: string): Promise<T> {
 }
 
 export const api = {
-  health: () => get<{ ok: boolean }>('/api/health'),
-  sessions: () => get<{ ok: boolean; sessions: ResumeSession[] }>('/api/sessions'),
+  health: () => get<{ ok: boolean; cwd: string }>('/api/health'),
+  catalog: () => get<PiCatalogResponse>('/api/catalog'),
+  directories: (path?: string) =>
+    get<DirectoryListingResponse>(`/api/directories${path ? `?path=${encodeURIComponent(path)}` : ''}`),
+  sessionLogUrl: (sessionPath: string) => `/api/session-log?path=${encodeURIComponent(sessionPath)}`,
+  sessions: (view: 'recent' | 'archived' = 'recent') =>
+    get<{ ok: boolean; sessions: ResumeSession[] }>(`/api/sessions${view === 'archived' ? '?view=archived' : ''}`),
+  archiveSession: (sessionPath: string) =>
+    post<SessionMutationResponse>('/api/sessions/archive', { sessionPath }),
+  restoreSession: (sessionPath: string) =>
+    post<SessionMutationResponse>('/api/sessions/restore', { sessionPath }),
+  deleteSession: (sessionPath: string) =>
+    post<SessionMutationResponse>('/api/sessions/delete', { sessionPath }),
   start: (key: string, cwd: string) =>
     post<{ ok: boolean; state?: SessionState; error?: string }>(`/api/${key}/start`, { cwd }),
-  prompt: (key: string, message: string) =>
-    post<{ ok: boolean; error?: string }>(`/api/${key}/prompt`, { message }),
-  steer: (key: string, message: string) =>
-    post<{ ok: boolean; error?: string }>(`/api/${key}/steer`, { message }),
+  prompt: (key: string, message: string, images?: ImageAttachment[]) =>
+    post<{ ok: boolean; error?: string }>(`/api/${key}/prompt`, { message, images }),
+  steer: (key: string, message: string, images?: ImageAttachment[]) =>
+    post<{ ok: boolean; error?: string }>(`/api/${key}/steer`, { message, images }),
   abort: (key: string) => post<{ ok: boolean; error?: string }>(`/api/${key}/abort`, {}),
-  newSession: (key: string) => post<{ ok: boolean; error?: string }>(`/api/${key}/new-session`, {}),
+  newSession: (key: string) => post<SessionSnapshotResponse>(`/api/${key}/new-session`, {}),
   resume: (key: string, sessionPath: string) =>
-    post<{ ok: boolean; error?: string }>(`/api/${key}/resume`, { sessionPath }),
+    post<SessionSnapshotResponse>(`/api/${key}/resume`, { sessionPath }),
+  fork: (key: string, timestamp: number) =>
+    post<SessionSnapshotResponse>(`/api/${key}/fork`, { timestamp }),
   compact: (key: string, customInstructions?: string) =>
     post<{ ok: boolean; error?: string }>(`/api/${key}/compact`, { customInstructions }),
   setModel: (key: string, provider: string, modelId: string) =>
-    post<{ ok: boolean; error?: string }>(`/api/${key}/set-model`, { provider, modelId }),
+    post<{ ok: boolean; data?: ModelInfo; state?: SessionState; error?: string }>(`/api/${key}/set-model`, { provider, modelId }),
   setThinking: (key: string, level: string) =>
     post<{ ok: boolean; error?: string }>(`/api/${key}/set-thinking`, { level }),
+  stop: (key: string) => post<{ ok: boolean; error?: string }>(`/api/${key}/stop`, {}),
+  configure: (
+    key: string,
+    cwd: string,
+    accessMode: 'workspace-write' | 'read-only',
+    agentMode: 'standard' | 'plan',
+    model?: ModelInfo | null,
+    thinkingLevel?: string,
+    sessionPath?: string,
+  ) => post<SessionSnapshotResponse>(`/api/${key}/configure`, {
+    cwd,
+    accessMode,
+    agentMode,
+    model,
+    thinkingLevel,
+    sessionPath,
+  }),
+  upload: (key: string, name: string, mimeType: string, data: string) =>
+    post<{ ok: boolean; path?: string; error?: string }>(`/api/${key}/upload`, { name, mimeType, data }),
   commands: (key: string) =>
     get<{ ok: boolean; commands: SlashCommand[] }>(`/api/${key}/commands`),
   models: (key: string) => get<{ ok: boolean; models: ModelInfo[] }>(`/api/${key}/models`),

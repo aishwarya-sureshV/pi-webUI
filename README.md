@@ -1,4 +1,4 @@
-# pi-web
+# pi-web workbench
 
 A DeepSeek-harness-style **web UI for your local pi coding agent**. Typing `pi`
 in a terminal now opens this web workbench in your browser; the classic terminal
@@ -9,7 +9,7 @@ TUI is one flag away.
   out to the browser over Server-Sent Events. Session history is discovered from
   `~/.pi/agent/sessions`.
 - **Frontend** (`src/`) is React + Vite and mirrors deepseek-harness's shell:
-  three-column layout (sidebar | conversation | details), its dark design tokens
+  responsive three-column layout (collapsible sidebar | conversation | details), its light/dark design tokens
   (`design-platform.css`), hero empty state with glow, and the docked composer card
   (content width + 32px). Message rendering is ported from AgentDeck's
   `AgentWorkbench`: collapsed tool cards for reads/shell, expanded diff cards for

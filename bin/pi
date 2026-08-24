@@ -3,7 +3,20 @@
 # falls through to the real terminal TUI.
 set -euo pipefail
 
-PI_WEB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve the real launcher location before finding the project root. Homebrew
+# exposes this script through /opt/homebrew/bin/pi, and BASH_SOURCE otherwise
+# points at that symlink instead of the pi-web checkout.
+LAUNCHER_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$LAUNCHER_PATH" ]]; do
+  LAUNCHER_DIR="$(cd -P "$(dirname "$LAUNCHER_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$LAUNCHER_PATH")"
+  if [[ "$LINK_TARGET" == /* ]]; then
+    LAUNCHER_PATH="$LINK_TARGET"
+  else
+    LAUNCHER_PATH="$LAUNCHER_DIR/$LINK_TARGET"
+  fi
+done
+PI_WEB_ROOT="$(cd -P "$(dirname "$LAUNCHER_PATH")/.." && pwd)"
 REAL_PI="/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
 PORT="${PI_WEB_PORT:-4319}"
 HOST="${PI_WEB_HOST:-127.0.0.1}"
@@ -37,16 +50,46 @@ for arg in "$@"; do
 done
 
 # Otherwise: launch the web workbench and open the browser.
-if ! curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
-  if [[ ! -d "$PI_WEB_ROOT/dist" ]]; then
-    echo "pi-web: building web assets (first run)…" >&2
-    (cd "$PI_WEB_ROOT" && npm run build) >&2
+if [[ ! -f "$PI_WEB_ROOT/package.json" || ! -f "$PI_WEB_ROOT/server/index.js" ]]; then
+  echo "pi-web: launcher could not find the project at $PI_WEB_ROOT" >&2
+  exit 1
+fi
+
+if [[ ! -d "$PI_WEB_ROOT/dist" ]]; then
+  echo "pi-web: building web assets (first run)…" >&2
+  (cd "$PI_WEB_ROOT" && npm run build) >&2
+fi
+
+LOCAL_BUILD_ID="$(shasum -a 256 "$PI_WEB_ROOT/dist/index.html" | awk '{print substr($1, 1, 12)}')"
+HEALTH_JSON="$(curl -sf "http://$HOST:$PORT/api/health" 2>/dev/null || true)"
+RUNNING_BUILD_ID="$(printf '%s' "$HEALTH_JSON" | sed -n 's/.*"buildId":"\([^"]*\)".*/\1/p')"
+
+# A long-running local server may still be serving a previous checkout build.
+# Replace only a process that identifies itself as pi-web through /api/health.
+if [[ -n "$HEALTH_JSON" && "$RUNNING_BUILD_ID" != "$LOCAL_BUILD_ID" ]]; then
+  STALE_SERVER_PID="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -n "$STALE_SERVER_PID" ]]; then
+    echo "pi-web: refreshing the running workbench…" >&2
+    kill "$STALE_SERVER_PID"
+    for _ in $(seq 1 30); do
+      curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
   fi
-  nohup node "$PI_WEB_ROOT/server/index.js" >/tmp/pi-web.log 2>&1 &
+fi
+
+if ! curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
+  nohup node "$PI_WEB_ROOT/server/index.js" </dev/null >/tmp/pi-web.log 2>&1 &
   for _ in $(seq 1 50); do
     curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1 && break
     sleep 0.1
   done
+  if ! curl -sf "http://$HOST:$PORT/api/health" >/dev/null 2>&1; then
+    echo "pi-web: server failed to start; see /tmp/pi-web.log" >&2
+    exit 1
+  fi
 fi
 
-open "http://$HOST:$PORT"
+LAUNCH_CWD="$(pwd -P)"
+ENCODED_CWD="$(node -p 'encodeURIComponent(process.argv[1])' "$LAUNCH_CWD")"
+open "http://$HOST:$PORT/?cwd=$ENCODED_CWD&fresh=$(date +%s)"
