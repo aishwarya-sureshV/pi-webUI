@@ -1,5 +1,5 @@
 ---
-description: One-shot bug localization (Agentless phase 1) — tree + grep hits in one call, commit to candidates, read only those ranges
+description: Use when a bug's location is unknown — "X is broken", "why does Y not work", an error message, a stack trace, unexpected UI behavior — and history is not the clue. Localizes in ONE grep pass (tree + hit list in a single call), commits to named candidate files and symbols, then reads only those ranges. Do NOT use for regressions (something that used to work) — use bisect for those.
 argument-hint: <symptom, error text, or "X does not work">
 allowed-tools: Bash, Read, Grep
 ---

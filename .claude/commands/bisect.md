@@ -1,5 +1,5 @@
 ---
-description: Regression hunting — build a failing predicate, git bisect run it, return the commit instead of reading code
+description: Use whenever something USED TO WORK and now does not — "this broke", "worked yesterday", "worked before the last commit", "used to be fine", a regression of any kind. Builds a failing predicate and runs git bisect to return the breaking commit, instead of reading code to guess what changed.
 argument-hint: <what broke> [-- <last known good ref>]
 allowed-tools: Bash, Read
 ---
