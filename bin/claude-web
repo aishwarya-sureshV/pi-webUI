@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# pi-web launcher: `pi` opens the web workbench; `pi --tui` (or piped stdin)
-# falls through to the real terminal TUI.
+# Claude Code launcher for pi-web. This is additive: it never intercepts or
+# forwards the real `claude` command.
 set -euo pipefail
 
-# Resolve the real launcher location before finding the project root. Homebrew
-# exposes this script through /opt/homebrew/bin/pi, and BASH_SOURCE otherwise
-# points at that symlink instead of the pi-web checkout.
 LAUNCHER_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$LAUNCHER_PATH" ]]; do
   LAUNCHER_DIR="$(cd -P "$(dirname "$LAUNCHER_PATH")" && pwd)"
@@ -17,7 +14,6 @@ while [[ -L "$LAUNCHER_PATH" ]]; do
   fi
 done
 PI_WEB_ROOT="$(cd -P "$(dirname "$LAUNCHER_PATH")/.." && pwd)"
-REAL_PI="/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
 PORT="${PI_WEB_PORT:-4319}"
 HOST="${PI_WEB_HOST:-127.0.0.1}"
 
@@ -36,55 +32,26 @@ clear_unresponsive_project_server() {
   server_cwd="$(lsof -a -p "$server_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
   server_command="$(ps -p "$server_pid" -o command= 2>/dev/null || true)"
   if [[ "$server_cwd" == "$PI_WEB_ROOT" && "$server_command" == *"server/index.js"* ]]; then
-    echo "pi-web: recovering an unresponsive local workbench…" >&2
+    echo "claude-web: recovering an unresponsive local workbench…" >&2
     kill "$server_pid"
     for _ in $(seq 1 20); do
       lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || return 0
       sleep 0.1
     done
-    echo "pi-web: the previous workbench did not release port $PORT" >&2
+    echo "claude-web: the previous workbench did not release port $PORT" >&2
     exit 1
   fi
-  echo "pi-web: port $PORT is in use by another application; set PI_WEB_PORT to use a different port" >&2
+  echo "claude-web: port $PORT is in use by another application; set PI_WEB_PORT to use a different port" >&2
   exit 1
 }
 
-passthrough=false
-for arg in "$@"; do
-  case "$arg" in
-    --tui) passthrough=true ;;
-  esac
-done
-
-# Non-interactive stdin, or explicit opt-outs, or flags that belong to the CLI
-# (help/version/print/rpc/list) -> delegate to the real terminal agent.
-if [[ "$passthrough" == "true" ]]; then
-  # strip the --tui flag itself before delegating
-  args=()
-  for arg in "$@"; do [[ "$arg" != "--tui" ]] && args+=("$arg"); done
-  exec node "$REAL_PI" "${args[@]}"
-fi
-
-if [[ ! -t 0 ]]; then
-  exec node "$REAL_PI" "$@"
-fi
-
-for arg in "$@"; do
-  case "$arg" in
-    --help|-h|--version|-v|--print|-p|--mode|--list-models|--continue|-c|--resume|-r)
-      exec node "$REAL_PI" "$@"
-      ;;
-  esac
-done
-
-# Otherwise: launch the web workbench and open the browser.
 if [[ ! -f "$PI_WEB_ROOT/package.json" || ! -f "$PI_WEB_ROOT/server/index.js" ]]; then
-  echo "pi-web: launcher could not find the project at $PI_WEB_ROOT" >&2
+  echo "claude-web: launcher could not find the project at $PI_WEB_ROOT" >&2
   exit 1
 fi
 
 if [[ ! -d "$PI_WEB_ROOT/dist" ]]; then
-  echo "pi-web: building web assets (first run)…" >&2
+  echo "claude-web: building web assets (first run)…" >&2
   (cd "$PI_WEB_ROOT" && npm run build) >&2
 fi
 
@@ -92,15 +59,13 @@ LOCAL_BUILD_ID="$(shasum -a 256 "$PI_WEB_ROOT/dist/index.html" | awk '{print sub
 HEALTH_JSON="$(health_json)"
 RUNNING_BUILD_ID="$(printf '%s' "$HEALTH_JSON" | sed -n 's/.*"buildId":"\([^"]*\)".*/\1/p')"
 
-# A long-running local server may still be serving a previous checkout build.
-# Replace only a process that identifies itself as pi-web through /api/health.
 if [[ -n "$HEALTH_JSON" && "$RUNNING_BUILD_ID" != "$LOCAL_BUILD_ID" ]]; then
   STALE_SERVER_PID="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "$STALE_SERVER_PID" ]]; then
-    echo "pi-web: refreshing the running workbench…" >&2
+    echo "claude-web: refreshing the running workbench…" >&2
     kill "$STALE_SERVER_PID"
     for _ in $(seq 1 30); do
-      health_ready || break
+      if ! health_ready; then break; fi
       sleep 0.1
     done
   fi
@@ -110,15 +75,15 @@ if ! health_ready; then
   clear_unresponsive_project_server
   nohup node "$PI_WEB_ROOT/server/index.js" </dev/null >/tmp/pi-web.log 2>&1 &
   for _ in $(seq 1 30); do
-    health_ready && break
+    if health_ready; then break; fi
     sleep 0.1
   done
   if ! health_ready; then
-    echo "pi-web: server failed to start; see /tmp/pi-web.log" >&2
+    echo "claude-web: server failed to start; see /tmp/pi-web.log" >&2
     exit 1
   fi
 fi
 
 LAUNCH_CWD="$(pwd -P)"
 ENCODED_CWD="$(node -p 'encodeURIComponent(process.argv[1])' "$LAUNCH_CWD")"
-open "http://$HOST:$PORT/?cwd=$ENCODED_CWD&fresh=$(date +%s)"
+open "http://$HOST:$PORT/?backend=claude&cwd=$ENCODED_CWD&fresh=$(date +%s)"

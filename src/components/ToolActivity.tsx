@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { TimelineItem } from '../lib/timeline'
 import { summarizeTool } from '../lib/toolCards'
+import { langFromPath } from '../lib/toolCards'
+import { highlightCode } from '../lib/highlight'
 import { CopyButton } from './CopyButton'
 
 type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
@@ -101,16 +103,37 @@ function commandText(item: ToolItem): string {
 }
 
 export function ToolDetailsRail({ group, onClose }: { group: ToolGroup; onClose: () => void }) {
+  const [width, setWidth] = useState(() => Number(localStorage.getItem('pi-web.tool-rail-width')) || 480)
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     window.addEventListener('keydown', close)
     return () => window.removeEventListener('keydown', close)
   }, [onClose])
 
+  const beginResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const startX = event.clientX
+    const startWidth = width
+    const move = (moveEvent: PointerEvent) => {
+      setWidth(Math.min(Math.max(startWidth + startX - moveEvent.clientX, 340), window.innerWidth * 0.9))
+    }
+    const stop = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+      setWidth((current) => {
+        localStorage.setItem('pi-web.tool-rail-width', String(Math.round(current)))
+        return current
+      })
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+  }
+
   return (
     <div className="tool-rail-layer">
       <button type="button" className="tool-rail__backdrop" aria-label="Close command details" onClick={onClose} />
-      <aside className="tool-rail" aria-label={group.title}>
+      <aside className="tool-rail" aria-label={group.title} style={{ width }}>
+        <button type="button" className="tool-rail__resize" aria-label="Resize file details" onPointerDown={beginResize} />
         <header className="tool-rail__header">
           <div><span>{group.icon}</span><strong>{group.title}</strong></div>
           <button type="button" aria-label="Close command details" onClick={onClose}>×</button>
@@ -128,9 +151,11 @@ export function ToolDetailsRail({ group, onClose }: { group: ToolGroup; onClose:
                 <div className="tool-rail__detail">
                   <div className="tool-rail__command">
                     <code>{command}</code>
-                    <CopyButton text={command} label="Copy command" className="tool-rail__copy" />
+                    <CopyButton text={command} label="Copy command" className="tool-rail__copy" iconOnly />
                   </div>
-                  {item.output && <pre>{item.output}</pre>}
+                  {item.output && (
+                    <pre><code>{highlightCode(item.output, langFromPath(String(item.args.path ?? item.args.file_path ?? '')))}</code></pre>
+                  )}
                 </div>
               </details>
             )

@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { useStore } from '../lib/store'
 import type { WorkbenchView } from '../lib/navigation'
 import { formatRelativeTime } from '../lib/time'
+import { savedSessionTitle } from '../lib/sessionTitle'
 import {
   FishLogo,
   IconArchive,
+  IconChevronDown,
   IconCube,
   IconDots,
   IconExtension,
@@ -15,7 +17,9 @@ import {
   IconRestore,
   IconSettings,
   IconSun,
+  IconTerminal,
   IconTrash,
+  IconColumns,
 } from './icons'
 
 function workspaceLabel(cwd: string): string {
@@ -30,6 +34,13 @@ export function Sidebar({
   onThemeToggle,
   view,
   onViewChange,
+  splitSessions,
+  onSplitSessionsToggle,
+  onSessionFocus,
+  onSessionSplit,
+  openTabKeys,
+  onResizePointerDown,
+  onResizeKeyDown,
 }: {
   collapsed: boolean
   onToggle: () => void
@@ -37,10 +48,19 @@ export function Sidebar({
   onThemeToggle: () => void
   view: WorkbenchView
   onViewChange: (view: WorkbenchView) => void
+  splitSessions: boolean
+  onSplitSessionsToggle: () => void
+  onSessionFocus: (key: string) => void
+  onSessionSplit: (key: string) => void
+  openTabKeys: string[]
+  onResizePointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void
+  onResizeKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void
 }) {
   const [sessionView, setSessionView] = useState<'recent' | 'archived'>('recent')
   const [openSessionMenu, setOpenSessionMenu] = useState<string | null>(null)
   const [openWorkspaceMenu, setOpenWorkspaceMenu] = useState<string | null>(null)
+  const [backendMenuOpen, setBackendMenuOpen] = useState(false)
+  const currentBackend = new URLSearchParams(window.location.search).get('backend') === 'claude' ? 'claude' : 'pi'
   const [sessionMenuOpensUp, setSessionMenuOpensUp] = useState(false)
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set())
   const initializedWorkspaceGroups = useRef(false)
@@ -59,6 +79,10 @@ export function Sidebar({
     deleteSession,
   } = useStore()
 
+  const openTabs = openTabKeys.flatMap((key) => {
+    const tab = tabs.find((candidate) => candidate.key === key)
+    return tab ? [tab] : []
+  })
   const savedSessions = sessionView === 'archived' ? archivedSessions : resumeSessions
   const workspaceGroups = useMemo(() => {
     const groups = new Map<string, typeof savedSessions>()
@@ -77,18 +101,20 @@ export function Sidebar({
   }, [tabs, workspaceGroups])
 
   useEffect(() => {
-    if (!openSessionMenu && !openWorkspaceMenu) return
+    if (!openSessionMenu && !openWorkspaceMenu && !backendMenuOpen) return
     const closeOnOutsideClick = (event: PointerEvent) => {
       const target = event.target
       if (!(target instanceof Element) || !target.closest('.sidebar__floating-menu')) {
         setOpenSessionMenu(null)
         setOpenWorkspaceMenu(null)
+        setBackendMenuOpen(false)
       }
     }
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
         setOpenSessionMenu(null)
         setOpenWorkspaceMenu(null)
+        setBackendMenuOpen(false)
       }
     }
     document.addEventListener('pointerdown', closeOnOutsideClick)
@@ -97,12 +123,22 @@ export function Sidebar({
       document.removeEventListener('pointerdown', closeOnOutsideClick)
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [openSessionMenu, openWorkspaceMenu])
+  }, [openSessionMenu, openWorkspaceMenu, backendMenuOpen])
 
-  const startFresh = (cwd?: string) => {
+  const startFresh = async (cwd?: string) => {
     onViewChange('sessions')
-    if (cwd) openConversation(cwd)
-    else void openDefaultConversation()
+    const key = cwd ? openConversation(cwd) : await openDefaultConversation()
+    onSessionFocus(key)
+  }
+
+  const switchBackend = (next: 'pi' | 'claude') => {
+    setBackendMenuOpen(false)
+    if (next === currentBackend) return
+    const params = new URLSearchParams(window.location.search)
+    if (next === 'claude') params.set('backend', 'claude')
+    else params.delete('backend')
+    const query = params.toString()
+    window.location.assign(`${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`)
   }
 
   const handleArchive = async (session: (typeof savedSessions)[number]) => {
@@ -120,7 +156,7 @@ export function Sidebar({
   const handleDelete = async (session: (typeof savedSessions)[number]) => {
     setOpenSessionMenu(null)
     const confirmed = window.confirm(
-      `Permanently delete “${session.name}”?\n\nThis removes the saved Pi session and cannot be undone.`,
+      `Permanently delete “${session.name}”?\n\nThis removes the saved ${session.backend === 'claude' ? 'Claude' : 'Pi'} session and cannot be undone.`,
     )
     if (!confirmed) return
     const result = await deleteSession(session)
@@ -142,15 +178,65 @@ export function Sidebar({
     setOpenWorkspaceMenu(null)
   }
 
+  const focusOpenSession = (key: string) => {
+    setActiveKey(key)
+    onSessionFocus(key)
+    chooseView('sessions')
+  }
+
+  const splitOpenSession = (key: string) => {
+    onSessionSplit(key)
+    setActiveKey(key)
+    chooseView('sessions')
+  }
+
+  const focusSavedSession = (session: (typeof savedSessions)[number]) => {
+    const key = resumeConversation(session)
+    onSessionFocus(key)
+    chooseView('sessions')
+  }
+
+  const splitSavedSession = (session: (typeof savedSessions)[number]) => {
+    const key = resumeConversation(session)
+    onSessionSplit(key)
+    chooseView('sessions')
+  }
+
   return (
     <aside className={`sidebar${collapsed ? ' is-collapsed' : ''}`}>
       <div className="sidebar__brand-row">
         {!collapsed && (
-          <button type="button" className="sidebar__brand" onClick={() => startFresh()} aria-label="New session">
+          <div className="sidebar__brand">
             <FishLogo size={25} />
-            <span>pi</span>
+            <div className="sidebar__backend-menu sidebar__floating-menu">
+              <button
+                type="button"
+                className="sidebar__backend-trigger"
+                aria-haspopup="menu"
+                aria-expanded={backendMenuOpen}
+                aria-label={`Current workbench: ${currentBackend === 'claude' ? 'Claude' : 'Pi'}. Open workbench menu.`}
+                onClick={() => {
+                  setOpenSessionMenu(null)
+                  setOpenWorkspaceMenu(null)
+                  setBackendMenuOpen((open) => !open)
+                }}
+              >
+                <span>{currentBackend === 'claude' ? 'claude' : 'pi'}</span>
+                <IconChevronDown size={14} />
+              </button>
+              {backendMenuOpen && (
+                <div className="sidebar__session-popover sidebar__backend-popover" role="menu">
+                  <button type="button" role="menuitem" className={currentBackend === 'pi' ? 'is-active' : undefined} onClick={() => switchBackend('pi')}>
+                    Pi
+                  </button>
+                  <button type="button" role="menuitem" className={currentBackend === 'claude' ? 'is-active' : undefined} onClick={() => switchBackend('claude')}>
+                    Claude
+                  </button>
+                </div>
+              )}
+            </div>
             <em>WORKBENCH</em>
-          </button>
+          </div>
         )}
         <button type="button" className="sidebar__icon-btn sidebar__toggle" onClick={onToggle} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
           {collapsed && <span className="sidebar__rail-fish"><FishLogo size={24} /></span>}
@@ -167,32 +253,56 @@ export function Sidebar({
         <SidebarNavButton collapsed={collapsed} active={view === 'sessions'} label="Sessions" onClick={() => chooseView('sessions')} icon={<IconFolder size={18} />} />
         <SidebarNavButton collapsed={collapsed} active={view === 'skills'} label="Skills" onClick={() => chooseView('skills')} icon={<IconCube size={18} />} />
         <SidebarNavButton collapsed={collapsed} active={view === 'extensions'} label="Extensions" onClick={() => chooseView('extensions')} icon={<IconExtension size={18} />} />
+        <SidebarNavButton collapsed={collapsed} active={view === 'terminal'} label="Terminal" onClick={() => chooseView('terminal')} icon={<IconTerminal size={18} />} />
         <SidebarNavButton collapsed={collapsed} active={view === 'settings'} label="Settings" onClick={() => chooseView('settings')} icon={<IconSettings size={18} />} />
       </nav>
 
       {!collapsed && (
         <div className="sidebar__section">
-          {tabs.length > 0 && <div className="sidebar__heading">Open</div>}
-          {tabs.map((tab) => (
+          {openTabs.length > 0 && (
+            <div className="sidebar__open-head">
+              <div className="sidebar__heading">Open</div>
+              <button
+                type="button"
+                className={splitSessions ? 'is-active' : ''}
+                aria-pressed={splitSessions}
+                aria-label={splitSessions ? 'Show one session at a time' : 'Show sessions side by side'}
+                title={splitSessions ? 'Focus one session' : 'Split sessions'}
+                onClick={onSplitSessionsToggle}
+              >
+                <IconColumns />
+              </button>
+            </div>
+          )}
+          {openTabs.map((tab) => (
             <div className="sidebar__item-row" key={tab.key}>
               <button
                 type="button"
                 className={`sidebar__item${tab.key === activeKey && view === 'sessions' ? ' is-active' : ''}`}
-                onClick={() => { setActiveKey(tab.key); chooseView('sessions') }}
+                onClick={() => focusOpenSession(tab.key)}
                 title={tab.cwd}
               >
                 <span className="sidebar__item-label">{tab.label}</span>
               </button>
+              <button type="button" className="sidebar__item-split" aria-label={`Split with ${tab.label}`} title="Open in split view" onClick={() => splitOpenSession(tab.key)}><IconColumns size={14} /></button>
               <button type="button" className="sidebar__item-close" aria-label={`Close ${tab.label}`} onClick={() => closeConversation(tab.key)}>×</button>
             </div>
           ))}
 
           <div className="sidebar__saved-head">
             <span className="sidebar__heading">Sessions</span>
-            <div className="sidebar__saved-switch" aria-label="Saved session view">
-              <button type="button" className={sessionView === 'recent' ? 'is-active' : ''} aria-pressed={sessionView === 'recent'} onClick={() => { setSessionView('recent'); setOpenSessionMenu(null) }}>Recent</button>
-              <button type="button" className={sessionView === 'archived' ? 'is-active' : ''} aria-pressed={sessionView === 'archived'} onClick={() => { setSessionView('archived'); setOpenSessionMenu(null) }}>Archived</button>
-            </div>
+            <label className="sidebar__saved-select">
+              <span className="sr-only">Saved session view</span>
+              <select
+                aria-label="Saved session view"
+                value={sessionView}
+                onChange={(event) => { setSessionView(event.target.value as 'recent' | 'archived'); setOpenSessionMenu(null) }}
+              >
+                <option value="recent">Recent</option>
+                <option value="archived">Archived</option>
+              </select>
+              <IconChevronDown size={12} />
+            </label>
           </div>
 
           {workspaceGroups.map((group) => {
@@ -229,22 +339,30 @@ export function Sidebar({
 
                 {!groupCollapsed && group.sessions.map((session) => {
                   const isOpen = tabs.some((tab) => tab.sessionPath === session.path || tab.timeline.state?.sessionFile === session.path)
+                  const title = savedSessionTitle(session.name, session.firstPrompt)
                   return (
                     <div className="sidebar__saved-row" key={session.path}>
                       <button
                         type="button"
                         className={`sidebar__item${isOpen ? ' is-active-session' : ''}`}
                         title={session.path}
-                        onClick={() => { resumeConversation(session); chooseView('sessions') }}
+                        onClick={() => focusSavedSession(session)}
                       >
-                        <span className="sidebar__item-label">{session.name}</span>
+                        <span className="sidebar__item-label">{title}</span>
                         <span className="sidebar__item-meta">{formatRelativeTime(session.modifiedAt)}</span>
                       </button>
+                      <button
+                        type="button"
+                        className="sidebar__saved-split"
+                        aria-label={`Split with ${title}`}
+                        title="Open in split view"
+                        onClick={() => splitSavedSession(session)}
+                      ><IconColumns size={14} /></button>
                       <div className="sidebar__session-menu sidebar__floating-menu">
                         <button
                           type="button"
                           className="sidebar__session-trigger"
-                          aria-label={`Actions for ${session.name}`}
+                          aria-label={`Actions for ${title}`}
                           aria-expanded={openSessionMenu === session.path}
                           onClick={(event) => {
                             event.stopPropagation()
@@ -274,6 +392,16 @@ export function Sidebar({
         </div>
       )}
 
+      {!collapsed && (
+        <button
+          type="button"
+          className="sidebar-resizer"
+          aria-label="Resize sidebar"
+          title="Drag to resize sidebar"
+          onPointerDown={onResizePointerDown}
+          onKeyDown={onResizeKeyDown}
+        />
+      )}
       <button type="button" className="sidebar__footer" onClick={onThemeToggle} aria-label={theme === 'dark' ? 'Use light theme' : 'Use dark theme'}>
         {theme === 'dark' ? <IconSun /> : <IconMoon />}
         {!collapsed && <span>{theme === 'dark' ? 'Light appearance' : 'Dark appearance'}</span>}

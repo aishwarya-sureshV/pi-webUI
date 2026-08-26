@@ -31,10 +31,14 @@
   --pw-user-bg: #fcf5e6;
   --pw-code: #4a4437;
   --pw-stripe: rgba(38, 32, 24, 0.09);
-  --pw-add-bg: rgba(63, 111, 57, 0.10);
-  --pw-add-fg: #33602e;
-  --pw-del-bg: rgba(164, 57, 46, 0.09);
-  --pw-del-fg: #8d3a30;
+  --pw-add-bg: rgba(45, 125, 36, 0.14);
+  --pw-add-fg: #27501f;
+  --pw-add-line: rgba(45, 125, 36, 0.5);
+  --pw-add-sign: #2f7a29;
+  --pw-del-bg: rgba(184, 45, 30, 0.12);
+  --pw-del-fg: #7e2e24;
+  --pw-del-line: rgba(184, 45, 30, 0.45);
+  --pw-del-sign: #ab2f21;
 
   --dsw-alias-bg-base: #f4f1e9;
   --dsw-alias-bg-layer-1: var(--pw-card);
@@ -106,10 +110,14 @@ body[data-ds-dark-theme] {
   --pw-user-bg: #17150f;
   --pw-code: #a8a099;
   --pw-stripe: rgba(255, 255, 255, 0.07);
-  --pw-add-bg: rgba(134, 183, 132, 0.09);
-  --pw-add-fg: #cfe0ce;
-  --pw-del-bg: rgba(212, 121, 111, 0.08);
-  --pw-del-fg: #c9938c;
+  --pw-add-bg: rgba(112, 190, 105, 0.14);
+  --pw-add-fg: #ddd6c9;
+  --pw-add-line: rgba(112, 190, 105, 0.55);
+  --pw-add-sign: #79a874;
+  --pw-del-bg: rgba(224, 96, 82, 0.13);
+  --pw-del-fg: #ddd6c9;
+  --pw-del-line: rgba(224, 96, 82, 0.55);
+  --pw-del-sign: #c4867c;
 
   --dsw-alias-bg-base: #0e0d0b;
   --dsw-alias-bg-layer-1: var(--pw-card);

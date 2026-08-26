@@ -11,12 +11,13 @@ export function DetailsPanel() {
     <>
       <div className="details__head">Session</div>
       <div className="details__body">
-        <div className="details__row"><span>project</span><span>{active?.cwd.replace(/^\/Users\/[^/]+/, '~')}</span></div>
+        <div className="details__row"><span>project</span><span title={active?.cwd}>{active?.cwd.replace(/^\/Users\/[^/]+/, '~')}</span></div>
+        <div className="details__row"><span>backend</span><span>{active?.backend === 'claude' ? 'Claude Code' : 'pi'}</span></div>
         <div className="details__row"><span>model</span><span>{state?.model?.name ?? state?.model?.id ?? '—'}</span></div>
         <div className="details__row"><span>thinking</span><span>{state?.thinkingLevel ?? 'off'}</span></div>
         <div className="details__row"><span>messages</span><span>{state?.messageCount ?? user.length}</span></div>
         <div className="details__row"><span>tool calls</span><span>{tools.length}</span></div>
-        <div className="details__row"><span>session file</span><span style={{ wordBreak: 'break-all' }}>{state?.sessionFile ?? '—'}</span></div>
+        <div className="details__row details__row--path"><span>session file</span><code title={state?.sessionFile}>{state?.sessionFile ?? '—'}</code></div>
       </div>
     </>
   )

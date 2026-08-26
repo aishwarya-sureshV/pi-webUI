@@ -2,12 +2,12 @@
  * Timeline model: converts pi RPC events into renderable items, porting
  * AgentDeck's AgentWorkbench semantics (tool cards, rationale, streaming text).
  */
-import type { AgentEvent, RunStatus, SessionHistoryMessage, SessionState } from './api'
+import type { AgentEvent, BackendLogEntry, RunStatus, SessionHistoryMessage, SessionState } from './api'
 
 export type TimelineItem =
   | { id: string; kind: 'user'; text: string; timestamp: number }
   | { id: string; kind: 'rationale'; text: string; live: boolean; timestamp: number }
-  | { id: string; kind: 'assistant'; text: string; live: boolean; timestamp: number }
+  | { id: string; kind: 'assistant'; text: string; live: boolean; timestamp: number; provider?: string; modelId?: string }
   | {
       id: string
       kind: 'tool'
@@ -74,6 +74,7 @@ function historyTimestamp(message: SessionHistoryMessage): number {
 
 export class Timeline {
   items: TimelineItem[] = []
+  backendLog: BackendLogEntry[] = []
   status: RunStatus = 'stopped'
   state: SessionState | null = null
   cycle = 0
@@ -110,6 +111,49 @@ export class Timeline {
     ])
   }
 
+  appendAssistant(text: string) {
+    if (!text) return
+    this.updateItems((current) => [
+      ...current,
+      { id: crypto.randomUUID(), kind: 'assistant', text, live: false, timestamp: Date.now() },
+    ])
+  }
+
+  private appendBackendEvent(event: AgentEvent) {
+    if (event.type === '__hello') return
+    const id = typeof event.__logId === 'string' ? event.__logId : crypto.randomUUID()
+    if (this.backendLog.some((entry) => entry.id === id)) return
+    const timestamp = typeof event.__loggedAt === 'number' ? event.__loggedAt : Date.now()
+    const source = typeof event.__logSource === 'string' ? event.__logSource : 'agent'
+    const payload = Object.fromEntries(
+      Object.entries(event).filter(([key]) => !key.startsWith('__')),
+    )
+    this.backendLog = [...this.backendLog, {
+      id,
+      timestamp,
+      source,
+      type: event.type,
+      payload,
+    }]
+    this.notify()
+  }
+
+  hydrateBackendLog(entries: BackendLogEntry[]) {
+    const byId = new Map(this.backendLog.map((entry) => [entry.id, entry]))
+    entries.forEach((entry) => {
+      if (!entry || typeof entry.id !== 'string' || byId.has(entry.id)) return
+      byId.set(entry.id, {
+        id: entry.id,
+        timestamp: Number(entry.timestamp) || Date.now(),
+        source: String(entry.source || 'agent'),
+        type: String(entry.type || 'unknown'),
+        payload: asRecord(entry.payload),
+      })
+    })
+    this.backendLog = [...byId.values()].sort((left, right) => left.timestamp - right.timestamp)
+    this.notify()
+  }
+
   reset(state: SessionState | null = this.state) {
     this.items = []
     this.streams.clear()
@@ -137,6 +181,8 @@ export class Timeline {
         if (error) {
           items.push({ id: `history-error-${messageIndex}`, kind: 'notice', text: error, tone: 'error', timestamp })
         }
+        const provider = typeof message.provider === 'string' ? message.provider : undefined
+        const modelId = typeof message.model === 'string' ? message.model : undefined
         if (!Array.isArray(message.content)) return
         message.content.forEach((part, contentIndex) => {
           const content = asRecord(part)
@@ -146,7 +192,7 @@ export class Timeline {
             if (text) items.push({ id: `history-rationale-${messageIndex}-${contentIndex}`, kind: 'rationale', text, live: false, timestamp })
           } else if (type === 'text') {
             const text = typeof content.text === 'string' ? content.text : ''
-            if (text) items.push({ id: `history-assistant-${messageIndex}-${contentIndex}`, kind: 'assistant', text, live: false, timestamp })
+            if (text) items.push({ id: `history-assistant-${messageIndex}-${contentIndex}`, kind: 'assistant', text, live: false, timestamp, provider, modelId })
           } else if (type === 'toolCall') {
             const id = String(content.id ?? `history-tool-${messageIndex}-${contentIndex}`)
             const tool: TimelineItem = {
@@ -257,6 +303,7 @@ export class Timeline {
   }
 
   handle(event: AgentEvent) {
+    this.appendBackendEvent(event)
     if (event.type === '__status') {
       this.status = (event.status as RunStatus) ?? 'ready'
       if (event.error) this.appendNotice(String(event.error), 'error')
@@ -265,6 +312,16 @@ export class Timeline {
     }
     if (event.type === 'stderr') {
       this.appendNotice(String(event.message ?? ''), 'warning')
+      return
+    }
+    if (event.type === 'subagent_start') {
+      this.appendNotice('Subagent started. Its progress will appear inline.', 'info')
+      return
+    }
+    if (event.type === 'system' && String(event.subtype ?? '').toLowerCase().includes('hook')) {
+      const subtype = String(event.subtype ?? 'hook').replaceAll('_', ' ')
+      const name = String(event.hook_name ?? event.hookName ?? event.hook_event ?? '').trim()
+      this.appendNotice(`${subtype}${name ? ` · ${name}` : ''}`, 'info')
       return
     }
     if (event.type === 'turn_start') { this.cycle += 1; return }
@@ -282,14 +339,15 @@ export class Timeline {
       const updateType = String(update.type ?? '')
       const delta = typeof update.delta === 'string' ? update.delta : ''
       const content = typeof update.content === 'string' ? update.content : ''
+      const streamKey = typeof event.streamKey === 'string' ? event.streamKey : String(this.cycle)
       if (updateType === 'thinking_delta') {
-        this.upsertStream(`rationale-${this.cycle}-${contentIndex}`, 'rationale', delta)
+        this.upsertStream(`rationale-${streamKey}-${contentIndex}`, 'rationale', delta)
       } else if (updateType === 'thinking_end') {
-        this.upsertStream(`rationale-${this.cycle}-${contentIndex}`, 'rationale', '', content)
+        this.upsertStream(`rationale-${streamKey}-${contentIndex}`, 'rationale', '', content)
       } else if (updateType === 'text_delta') {
-        this.upsertStream(`assistant-${this.cycle}-${contentIndex}`, 'assistant', delta)
+        this.upsertStream(`assistant-${streamKey}-${contentIndex}`, 'assistant', delta)
       } else if (updateType === 'text_end') {
-        this.upsertStream(`assistant-${this.cycle}-${contentIndex}`, 'assistant', '', content)
+        this.upsertStream(`assistant-${streamKey}-${contentIndex}`, 'assistant', '', content)
       }
       return
     }
@@ -303,16 +361,22 @@ export class Timeline {
       // accounts), message_end still carries the whole assistant message.
       const finalText = extractText(message.content)
       const finalTimestamp = historyTimestamp(message)
+      const streamKey = typeof event.streamKey === 'string' ? event.streamKey : String(this.cycle)
+      // Ground truth for "which model actually answered": the RPC layer tags
+      // every assistant message with the model that produced it, independent
+      // of what the model's own text claims (self-identification is unreliable).
+      const provider = typeof message.provider === 'string' ? message.provider : undefined
+      const modelId = typeof message.model === 'string' ? message.model : undefined
       if (finalText) {
         // Deltas may have already rendered this exact text at any content index
         // this cycle; only fall back to message_end when nothing matches.
         const already = this.items.some(
-          (item) => item.kind === 'assistant' && item.id.startsWith(`assistant-${this.cycle}-`) && item.text.trim() === finalText.trim(),
+          (item) => item.kind === 'assistant' && item.id.startsWith(`assistant-${streamKey}-`) && item.text.trim() === finalText.trim(),
         )
-        if (!already) this.upsertStream(`assistant-${this.cycle}-0`, 'assistant', '', finalText)
+        if (!already) this.upsertStream(`assistant-${streamKey}-0`, 'assistant', '', finalText)
         this.updateItems((current) => current.map((item) =>
-          item.kind === 'assistant' && item.id.startsWith(`assistant-${this.cycle}-`)
-            ? { ...item, timestamp: finalTimestamp }
+          item.kind === 'assistant' && item.id.startsWith(`assistant-${streamKey}-`)
+            ? { ...item, timestamp: finalTimestamp, provider, modelId }
             : item,
         ))
       }

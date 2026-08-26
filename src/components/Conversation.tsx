@@ -7,17 +7,22 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from 'react'
-import { api, type ModelInfo, type SlashCommand } from '../lib/api'
+import { api, subscribeEvents, type ModelInfo, type ProviderUsage, type SlashCommand } from '../lib/api'
 import { useStore, useTimeline, type ConversationTab } from '../lib/store'
+import { contextualSessionTitle, isLocalCommandText } from '../lib/sessionTitle'
+import { CLAUDE_DEFAULT_EFFORT, CLAUDE_DEFAULT_MODEL, CLAUDE_EFFORT_LEVELS, CLAUDE_MODELS, formatClaudeModelName } from '../lib/claudeModels'
+import { estimateContext } from '../lib/sessionMetrics'
 import type { TimelineItem } from '../lib/timeline'
 import { ToolCard } from './ToolCard'
 import { RichText } from './RichText'
 import type { ToolFileView } from '../lib/toolCards'
 import { FileViewer } from './FileViewer'
 import { Trajectory } from './Trajectory'
+import { BackendLog } from './BackendLog'
 import { WorkspacePicker } from './WorkspacePicker'
-import { PlanRail, type PlanStep } from './PlanRail'
 import { CopyButton } from './CopyButton'
+import { TodoTracker, TodoTranscript, extractTodos } from './TodoTracker'
+import { UsageSummary } from './UsageDisplay'
 import {
   ActiveRunIndicator,
   ToolActivitySummary,
@@ -33,7 +38,6 @@ import {
   IconFile,
   IconFork,
   IconPlus,
-  IconShield,
   IconStop,
   IconUpload,
   FishLogo,
@@ -42,6 +46,7 @@ import {
 type ModelOption = { provider: string; id: string; label: string }
 type AccessMode = 'workspace-write' | 'read-only'
 type AgentMode = 'standard' | 'plan'
+const USAGE_REFRESH_INTERVAL_MS = 5 * 60_000 + 30_000
 type Attachment = {
   id: string
   name: string
@@ -49,6 +54,23 @@ type Attachment = {
   size: number
   path: string
   imageData?: string
+}
+
+function isModelIdentityQuestion(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/\s+/g, ' ').trim()
+  return (
+    /\bwhat\b.{0,48}\b(?:model|provider|version)\b/.test(normalized)
+    || /\b(?:model|provider|version)\b.{0,48}\b(?:you|u|running)\b/.test(normalized)
+  )
+}
+
+function isUsageShortcut(value: string): boolean {
+  return /^\/(?:grok-cli-usage|grok-usage)$/i.test(value.trim())
+}
+
+function runtimeModelAnswer(model: ModelInfo): string {
+  const label = model.name || model.id
+  return `This session is running ${label} (${model.provider}/${model.id}), as reported by the backend.`
 }
 
 function fileAsBase64(file: File): Promise<string> {
@@ -60,47 +82,71 @@ function fileAsBase64(file: File): Promise<string> {
   })
 }
 
-export function Conversation({ tab }: { tab: ConversationTab }) {
+export function Conversation({
+  tab,
+  split = false,
+  paneIndex = 0,
+  paneCount = 1,
+  onClose,
+}: {
+  tab: ConversationTab
+  split?: boolean
+  paneIndex?: number
+  paneCount?: number
+  onClose?: () => void
+}) {
   const timeline = useTimeline(tab.timeline)!
   const {
-    toggleDetails,
     refreshSessions,
     setConversationSessionPath,
     setConversationWorkspace,
+    setPreferredModel,
+    setConversationLabel,
   } = useStore()
   const [draft, setDraft] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [viewer, setViewer] = useState<ToolFileView | null>(null)
   const [commands, setCommands] = useState<SlashCommand[]>([])
-  const [models, setModels] = useState<ModelInfo[]>([])
-  const [levels, setLevels] = useState<string[]>([])
+  const [models, setModels] = useState<ModelInfo[]>(() => tab.backend === 'claude' ? CLAUDE_MODELS : [])
+  const [levels, setLevels] = useState<string[]>(() => tab.backend === 'claude' ? CLAUDE_EFFORT_LEVELS : [])
   const [commandMenuOpen, setCommandMenuOpen] = useState(false)
   const [accessMode, setAccessMode] = useState<AccessMode>('workspace-write')
   const [agentMode, setAgentMode] = useState<AgentMode>('standard')
-  const [planRailEnabled, setPlanRailEnabled] = useState(false)
-  const [planExecuting, setPlanExecuting] = useState(false)
   const [toolRail, setToolRail] = useState<ToolGroup | null>(null)
   const [forkingId, setForkingId] = useState<string | null>(null)
   const [configuring, setConfiguring] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
-  const [conversationView, setConversationView] = useState<'chat' | 'trajectory'>('chat')
+  const [conversationView, setConversationView] = useState<'chat' | 'trajectory' | 'backend'>('chat')
+  const [providerUsage, setProviderUsage] = useState<ProviderUsage | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const stickToBottom = useRef(true)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const addDetailsRef = useRef<HTMLDetailsElement | null>(null)
+  const usageRequestRef = useRef<Promise<boolean> | null>(null)
+  const usageRefreshPendingRef = useRef(false)
+  const commandRequestRef = useRef<Promise<void> | null>(null)
+  const modelMetadataRequestRef = useRef<Promise<void> | null>(null)
+  const commandsLoadedRef = useRef(false)
+  const modelMetadataLoadedRef = useRef(tab.backend === 'claude')
 
   const state = timeline.state
   const status = timeline.status
   const streaming = status === 'working' || state?.isStreaming === true
+  const firstUserItem = timeline.items.find((item) => item.kind === 'user' && !isLocalCommandText(item.kind === 'user' ? item.text : ''))
+  const firstUserText = firstUserItem?.kind === 'user' ? firstUserItem.text : undefined
+  const displayTitle = contextualSessionTitle(state?.sessionName || firstUserText || tab.label, tab.label)
+  const todos = extractTodos(timeline.items)
+  const context = estimateContext(timeline.items, state)
   const hasItems = timeline.items.length > 0
   const lastUserItemIndex = timeline.items.reduce(
     (lastIndex, item, index) => item.kind === 'user' ? index : lastIndex,
     -1,
   )
-  const visibleItems = timeline.items.filter((item, index) =>
-    item.kind !== 'rationale' || (streaming && index > lastUserItemIndex),
-  )
+  const visibleItems = timeline.items.filter((item, index) => {
+    if (item.kind === 'user' && isLocalCommandText(item.text)) return false
+    return item.kind !== 'rationale' || (streaming && index > lastUserItemIndex)
+  })
   const chatRows = buildChatRows(visibleItems, streaming)
   const responseActionIds = getResponseActionIds(visibleItems, streaming)
   const runningShell = streaming
@@ -109,25 +155,107 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
           item.kind === 'tool' && item.name.toLowerCase() === 'bash' && item.status === 'running',
       )
     : undefined
-  const hasRecordedPlan = timeline.items.some((item) =>
-    item.kind === 'assistant' && /(?:^|\n)\s*(?:#{1,6}\s*)?Plan:\s*(?:\n|$)/i.test(item.text),
-  )
-  const recordedPlanExecuting = timeline.items.some((item) =>
-    (item.kind === 'assistant' && /\[DONE:\d+\]/i.test(item.text))
-    || (item.kind === 'user' && item.text.trim().toLowerCase() === 'execute the plan'),
-  )
+
+  const loadModelMetadata = useCallback(() => {
+    if (modelMetadataLoadedRef.current || modelMetadataRequestRef.current || status === 'starting' || status === 'stopped') return
+    const request = Promise.all([api.models(tab.key, tab.backend), api.thinkingLevels(tab.key, tab.backend)])
+      .then(([modelResult, levelResult]) => {
+        if (modelResult.ok && Array.isArray(modelResult.models) && modelResult.models.length > 0) setModels(modelResult.models)
+        if (levelResult.ok && Array.isArray(levelResult.levels) && levelResult.levels.length > 0) setLevels(levelResult.levels)
+        if (modelResult.ok && levelResult.ok) modelMetadataLoadedRef.current = true
+      })
+      .finally(() => { modelMetadataRequestRef.current = null })
+    modelMetadataRequestRef.current = request
+  }, [status, tab.backend, tab.key])
+
+  const loadCommands = useCallback(() => {
+    if (commandsLoadedRef.current || commandRequestRef.current || status === 'starting' || status === 'stopped') return
+    const request = api.commands(tab.key, tab.backend)
+      .then((result) => {
+        if (result.ok && Array.isArray(result.commands)) {
+          setCommands(result.commands)
+          commandsLoadedRef.current = true
+        }
+      })
+      .finally(() => { commandRequestRef.current = null })
+    commandRequestRef.current = request
+  }, [status, tab.backend, tab.key])
 
   useEffect(() => {
-    if (status !== 'ready' && status !== 'working') return
+    if (draft.startsWith('/') || commandMenuOpen) loadCommands()
+  }, [commandMenuOpen, draft, loadCommands])
+
+  useEffect(() => {
     let cancelled = false
-    void Promise.all([api.commands(tab.key), api.models(tab.key), api.thinkingLevels(tab.key)]).then(([commandResult, modelResult, levelResult]) => {
-      if (cancelled) return
-      if (commandResult.ok && Array.isArray(commandResult.commands)) setCommands(commandResult.commands)
-      if (modelResult.ok && Array.isArray(modelResult.models)) setModels(modelResult.models)
-      if (levelResult.ok && Array.isArray(levelResult.levels)) setLevels(levelResult.levels)
+    void api.backendLog(tab.key).then((result) => {
+      if (!cancelled && result.ok && Array.isArray(result.entries)) timeline.hydrateBackendLog(result.entries)
     })
     return () => { cancelled = true }
-  }, [tab.key, status])
+  }, [tab.key, timeline])
+
+  const refreshUsage = useCallback((force = false): Promise<boolean> => {
+    if (usageRequestRef.current) return usageRequestRef.current
+    const request = api.usage(tab.key, tab.backend, force).then((result) => {
+      setProviderUsage(result.ok ? result.usage : null)
+      return result.ok
+    }).catch(() => {
+      setProviderUsage(null)
+      return false
+    }).finally(() => {
+      usageRequestRef.current = null
+    })
+    usageRequestRef.current = request
+    return request
+  }, [tab.backend, tab.key])
+
+  useEffect(() => {
+    // Refresh once when the session/page loads, then only on a slow cadence while
+    // visible. The server cache prevents remounts and split panes from repeatedly
+    // contacting the provider.
+    if (status === 'starting' || status === 'stopped' || !state) return
+    let timer: number | undefined
+    let cancelled = false
+
+    const schedule = () => {
+      if (cancelled || document.hidden) return
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        timer = undefined
+        void refreshUsage().finally(schedule)
+      }, USAGE_REFRESH_INTERVAL_MS)
+    }
+    const refreshOnVisible = () => {
+      if (document.hidden) {
+        if (timer !== undefined) window.clearTimeout(timer)
+        timer = undefined
+        return
+      }
+      const force = usageRefreshPendingRef.current
+      usageRefreshPendingRef.current = false
+      void refreshUsage(force).finally(schedule)
+    }
+
+    void refreshUsage().finally(schedule)
+    document.addEventListener('visibilitychange', refreshOnVisible)
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', refreshOnVisible)
+    }
+  }, [refreshUsage, state?.model?.id, state?.model?.provider, status])
+
+  useEffect(() => subscribeEvents((event) => {
+    if (event.sessionKey !== tab.key || event.type !== 'agent_settled') return
+    if (document.hidden) {
+      usageRefreshPendingRef.current = true
+      return
+    }
+    void refreshUsage(true)
+  }), [refreshUsage, tab.key])
+
+  useEffect(() => {
+    setConversationLabel(tab.key, displayTitle)
+  }, [displayTitle, setConversationLabel, tab.key])
 
   useLayoutEffect(() => {
     if (stickToBottom.current && scrollRef.current) {
@@ -182,16 +310,16 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
       nextMode,
       state?.model,
       state?.thinkingLevel,
+      undefined,
+      tab.backend,
     )
     setConfiguring(false)
     if (!result.ok || !result.state) {
-      timeline.appendNotice(result.error ?? 'Could not reconfigure the Pi session', 'error')
+      timeline.appendNotice(result.error ?? `Could not reconfigure the ${tab.backend === 'claude' ? 'Claude' : 'Pi'} session`, 'error')
       return
     }
     setAccessMode(nextAccess)
     setAgentMode(nextMode)
-    setPlanRailEnabled(nextMode === 'plan')
-    setPlanExecuting(false)
     timeline.reset(result.state)
     if (nextCwd !== tab.cwd) setConversationWorkspace(tab.key, nextCwd)
   }
@@ -205,7 +333,7 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
         timeline.hydrate(result.messages, result.state)
         setConversationSessionPath(tab.key, undefined)
       } else if (!result.ok) {
-        timeline.appendNotice(result.error ?? 'Could not create a new Pi session', 'error')
+        timeline.appendNotice(result.error ?? `Could not create a new ${tab.backend === 'claude' ? 'Claude' : 'Pi'} session`, 'error')
       }
       refreshSessions()
       setDraft('')
@@ -214,6 +342,11 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
     if (attachments.length === 0 && message === '/compact') {
       await api.compact(tab.key)
       setDraft('')
+      return
+    }
+    if (attachments.length === 0 && isUsageShortcut(message)) {
+      setDraft('')
+      if (!await refreshUsage(true)) timeline.appendNotice('Could not retrieve usage', 'error')
       return
     }
     const pickedAttachments = attachments
@@ -233,6 +366,15 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
     setDraft('')
     setAttachments([])
     stickToBottom.current = true
+
+    // A model's natural-language self-identification is not authoritative:
+    // aliases and provider prompts can make Luna claim to be Kimi. For this
+    // narrow question, answer from the session state that Pi reports instead.
+    if (pickedAttachments.length === 0 && state?.model && isModelIdentityQuestion(message)) {
+      timeline.appendAssistant(runtimeModelAnswer(state.model))
+      return
+    }
+
     const result = streaming
       ? await api.steer(tab.key, outboundMessage, images)
       : await api.prompt(tab.key, outboundMessage, images)
@@ -245,6 +387,10 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
   useEffect(() => {
     if (state?.sessionFile) setConversationSessionPath(tab.key, state.sessionFile)
   }, [setConversationSessionPath, state?.sessionFile, tab.key])
+
+  useEffect(() => {
+    if (state?.model) setPreferredModel(tab.backend, tab.cwd, state.model)
+  }, [setPreferredModel, state?.model, tab.backend, tab.cwd])
 
   useEffect(() => {
     const closeFloatingMenus = (event: PointerEvent) => {
@@ -286,24 +432,31 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
     }
   }
 
+  const textareaMinHeight = 48
   const autoGrow = () => {
     const el = textareaRef.current
     if (!el) return
     el.style.height = '0px'
-    el.style.height = `${Math.min(el.scrollHeight, 196)}px`
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, textareaMinHeight), 196)}px`
   }
+  useLayoutEffect(() => {
+    autoGrow()
+  })
 
   const modelOptions: ModelOption[] = models.map((m) => ({
     provider: m.provider,
     id: m.id,
-    label: m.name ?? m.id,
+    label: tab.backend === 'claude' || m.provider === 'anthropic'
+      ? formatClaudeModelName(m.name ?? m.id)
+      : (m.name ?? m.id),
   }))
-  const currentModel = state?.model ? `${state.model.provider}/${state.model.id}` : ''
+  const activeModel = state?.model ?? (tab.backend === 'claude' && tab.isFresh ? CLAUDE_DEFAULT_MODEL : null)
+  const currentModel = activeModel ? `${activeModel.provider}/${activeModel.id}` : ''
   const currentModelLabel = modelOptions.find((option) => `${option.provider}/${option.id}` === currentModel)?.label
-    ?? state?.model?.name
-    ?? state?.model?.id
+    ?? (tab.backend === 'claude' && activeModel ? formatClaudeModelName(activeModel.name ?? activeModel.id) : activeModel?.name)
+    ?? activeModel?.id
     ?? 'model…'
-  const effort = state?.thinkingLevel ?? 'off'
+  const effort = state?.thinkingLevel ?? (tab.backend === 'claude' && tab.isFresh ? CLAUDE_DEFAULT_EFFORT : 'off')
 
   const setModel = (value: string) => {
     const option = modelOptions.find((candidate) => `${candidate.provider}/${candidate.id}` === value)
@@ -315,15 +468,20 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
       }
       if (result.state) {
         timeline.setState(result.state)
+        setPreferredModel(tab.backend, tab.cwd, result.state.model)
       } else {
         const model = result.data
           ?? models.find((candidate) => candidate.provider === option.provider && candidate.id === option.id)
           ?? option
-        if (timeline.state) timeline.setState({ ...timeline.state, model })
+        if (timeline.state) {
+          timeline.setState({ ...timeline.state, model })
+          setPreferredModel(tab.backend, tab.cwd, model)
+        }
       }
-      void api.thinkingLevels(tab.key).then((levelResult) => {
+      void api.thinkingLevels(tab.key, tab.backend).then((levelResult) => {
         if (levelResult.ok && Array.isArray(levelResult.levels)) setLevels(levelResult.levels)
       })
+      void refreshUsage(true)
     })
   }
 
@@ -335,48 +493,6 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
       }
       if (timeline.state) timeline.setState({ ...timeline.state, thinkingLevel: level })
     })
-  }
-
-  const executePlan = async (steps: PlanStep[]) => {
-    if (streaming || steps.length === 0) return
-    const executionSession = await api.configure(
-      tab.key,
-      tab.cwd,
-      accessMode,
-      'standard',
-      state?.model,
-      state?.thinkingLevel,
-      state?.sessionFile,
-    )
-    if (!executionSession.ok || !executionSession.state) {
-      timeline.appendNotice(executionSession.error ?? 'Could not enter execution mode', 'error')
-      return
-    }
-    if (Array.isArray(executionSession.messages)) {
-      timeline.hydrate(executionSession.messages, executionSession.state)
-    } else {
-      timeline.setState(executionSession.state)
-    }
-    setAgentMode('standard')
-    setPlanExecuting(true)
-    const numberedPlan = steps.map((step) => `${step.number}. ${step.text}`).join('\n')
-    const displayMessage = 'Execute the plan'
-    const executionMessage = [
-      displayMessage,
-      '',
-      numberedPlan,
-      '',
-      'Execute each step in order. After completing a step, include [DONE:n], where n is the step number.',
-    ].join('\n')
-    timeline.appendUser(displayMessage)
-    stickToBottom.current = true
-    const result = await api.prompt(tab.key, executionMessage)
-    if (!result.ok) timeline.appendNotice(result.error ?? 'Could not start plan execution', 'error')
-  }
-
-  const refinePlan = () => {
-    setDraft('Refine the plan: ')
-    requestAnimationFrame(() => textareaRef.current?.focus())
   }
 
   const interrupt = useCallback(() => {
@@ -397,19 +513,35 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
     refreshSessions()
   }
 
-  const planRail = (planRailEnabled || hasRecordedPlan) ? (
-    <PlanRail
-      items={timeline.items}
-      state={state}
-      streaming={streaming}
-      executing={planExecuting || recordedPlanExecuting}
-      onExecute={(steps) => void executePlan(steps)}
-      onRefine={refinePlan}
-    />
-  ) : null
+  const setupChips = (
+    <div className="composer__setup">
+      <div className="hero__chips">
+        <WorkspacePicker
+          cwd={tab.cwd}
+          backend={tab.backend}
+          disabled={configuring}
+          onPick={(path) => configureSession(accessMode, agentMode, path)}
+        />
+        <div className="native-select native-select--chip native-select--mode">
+          <span className="native-select__icon"><IconCube size={15} /></span>
+          <select
+            aria-label="Agent mode"
+            value={agentMode}
+            disabled={configuring}
+            onChange={(event) => void configureSession(accessMode, event.target.value as AgentMode)}
+          >
+            <option value="standard">Standard mode</option>
+            <option value="plan">Plan mode</option>
+          </select>
+          <span className="native-select__chev"><IconChevronDown size={13} /></span>
+        </div>
+      </div>
+    </div>
+  )
 
   const composer = (
-    <div className={`composer${hasItems ? '' : ' composer--hero'}`}>
+    <div className="composer">
+      {!hasItems && setupChips}
       {slashOpen && slashMatches.length > 0 && (
         <div className="slash-menu">
           {slashMatches.map((command, index) => (
@@ -431,6 +563,7 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
           ))}
         </div>
       )}
+      {streaming && todos.length > 0 && <TodoTracker tasks={todos} />}
       <form
         className="composer__card"
         onSubmit={(e: FormEvent) => { e.preventDefault(); void send(draft) }}
@@ -499,6 +632,7 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
                   type="button"
                   onClick={() => {
                     if (addDetailsRef.current) addDetailsRef.current.open = false
+                    loadCommands()
                     setCommandMenuOpen(true)
                     setSlashIndex(0)
                     textareaRef.current?.focus()
@@ -506,29 +640,19 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
                 >
                   <span className="native-add-menu__icon"><IconCommand /></span>
                   <span>Slash commands</span>
-                  <em>{commands.length} from Pi</em>
+                  <em>{commands.length} from {tab.backend === 'claude' ? 'Claude' : 'Pi'}</em>
                 </button>
               </div>
             </details>
-            <div className="composer__modes">
-              <div className="native-select native-select--permission">
-                <span className="native-select__icon"><IconShield size={15} /></span>
-                <select
-                  aria-label="Access mode"
-                  value={accessMode}
-                  disabled={configuring || hasItems}
-                  title={hasItems ? 'Access mode is fixed after the first message' : undefined}
-                  onChange={(event) => void configureSession(event.target.value as AccessMode, agentMode)}
-                >
-                  <option value="workspace-write">Workspace Write</option>
-                  <option value="read-only">Read Only</option>
-                </select>
-                <span className="native-select__chev"><IconChevronDown size={13} /></span>
-              </div>
-            </div>
           </div>
           <div className="composer__trailing">
-            <div className="native-model-controls">
+            {providerUsage?.available && (
+              <>
+                <UsageSummary usage={providerUsage} />
+                <span className="usage-summary__rule" aria-hidden="true" />
+              </>
+            )}
+            <div className="native-model-controls" onPointerDown={loadModelMetadata} onFocus={loadModelMetadata}>
               <IconCube size={15} />
               <span className="native-model-controls__field native-model-controls__field--model" title={currentModelLabel}>
                 <span className="native-model-controls__value">{currentModelLabel}</span>
@@ -536,12 +660,17 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
                 <select
                   aria-label="Model"
                   value={currentModel}
-                  disabled={modelOptions.length === 0}
+                  disabled={configuring || streaming}
+                  title={streaming ? 'Wait for the current response to finish before changing model' : 'Change model for the next message'}
                   onChange={(event) => setModel(event.target.value)}
                 >
                   {!currentModel && <option value="">model…</option>}
                   {currentModel && !modelOptions.some((option) => `${option.provider}/${option.id}` === currentModel) && (
-                    <option value={currentModel}>{state?.model?.name ?? state?.model?.id ?? currentModel}</option>
+                    <option value={currentModel}>
+                      {tab.backend === 'claude'
+                        ? formatClaudeModelName(state?.model?.name ?? state?.model?.id ?? currentModel)
+                        : (state?.model?.name ?? state?.model?.id ?? currentModel)}
+                    </option>
                   )}
                   {modelOptions.map((option) => (
                     <option key={`${option.provider}/${option.id}`} value={`${option.provider}/${option.id}`}>
@@ -556,7 +685,7 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
                 <select
                   aria-label="Effort"
                   value={effort}
-                  disabled={levels.length === 0}
+                  disabled={configuring || streaming}
                   onChange={(event) => setEffort(event.target.value)}
                 >
                   {!levels.includes(effort) && <option value={effort}>{effort}</option>}
@@ -592,42 +721,34 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
   if (!hasItems) {
     return (
       <>
-        <div className={`conversation-stage${planRail ? ' has-plan-rail' : ''}`}>
+        {split && (
+          <div className="conversation-header conversation-header--empty">
+            <div className="conversation-header__top">
+              <div className="conversation-header__identity" title={`${displayTitle}\n${tab.cwd}`}>
+                <span className="conversation-header__pane-label">Session {paneIndex + 1} of {paneCount}</span>
+                <div className="conversation-header__title">{displayTitle}</div>
+                <div className="conversation-header__path">{tab.cwd}</div>
+              </div>
+              <span className={`conversation-header__backend is-${tab.backend}`}>{tab.backend === 'claude' ? 'Claude' : 'Pi'}</span>
+              <div className="conversation-header__spacer" />
+              {onClose && <button type="button" className="conversation-header__close" aria-label={`Close ${displayTitle}`} title="Close session" onClick={onClose}>×</button>}
+            </div>
+          </div>
+        )}
+        <div className="conversation-stage">
           <div className="conversation">
-            <div className="conversation__scroll" ref={scrollRef} />
             <div className="hero">
               <div className="hero__glow" />
               <div className="hero__stack">
                 <div className="hero__headline">
                   <span className="hero__fish"><FishLogo size={34} /></span>
-                  <span className="hero__title">Into the Unknown</span>
+                  <span className="hero__title">Onwards & Upwards</span>
                   <span className="hero__badge">Preview</span>
                 </div>
-                <div className="hero__chips">
-                  <WorkspacePicker
-                    cwd={tab.cwd}
-                    disabled={configuring}
-                    onPick={(path) => configureSession(accessMode, agentMode, path)}
-                  />
-                  <div className="native-select native-select--chip native-select--mode">
-                    <span className="native-select__icon"><IconCube size={15} /></span>
-                    <select
-                      aria-label="Agent mode"
-                      value={agentMode}
-                      disabled={configuring}
-                      onChange={(event) => void configureSession(accessMode, event.target.value as AgentMode)}
-                    >
-                      <option value="standard">Standard mode</option>
-                      <option value="plan">Plan mode</option>
-                    </select>
-                    <span className="native-select__chev"><IconChevronDown size={13} /></span>
-                  </div>
-                </div>
-                {composer}
               </div>
             </div>
+            {composer}
           </div>
-          {planRail}
         </div>
         {viewer && <FileViewer view={viewer} onClose={() => setViewer(null)} />}
       </>
@@ -638,9 +759,14 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
     <>
       <div className="conversation-header">
         <div className="conversation-header__top">
-          <div className="conversation-header__title">{state?.sessionName || tab.label}</div>
-          <div className="conversation-header__mode"><IconCube size={13} /> {agentMode === 'plan' ? 'Plan mode' : 'Standard mode'}</div>
-          <div className="conversation-header__status">{status}</div>
+          <div className="conversation-header__identity" title={`${displayTitle}\n${tab.cwd}`}>
+            {split && <span className="conversation-header__pane-label">Session {paneIndex + 1} of {paneCount}</span>}
+            <div className="conversation-header__title">{displayTitle}</div>
+            {split && <div className="conversation-header__path">{tab.cwd}</div>}
+          </div>
+          {split && <span className={`conversation-header__backend is-${tab.backend}`}>{tab.backend === 'claude' ? 'Claude' : 'Pi'}</span>}
+          {agentMode === 'plan' && <div className="conversation-header__mode"><IconCube size={13} /> Plan mode</div>}
+          {status === 'working' && <div className="conversation-header__status">Working</div>}
           <div className="conversation-header__spacer" />
           <a
             className={`conversation-header__download${state?.sessionFile ? '' : ' is-disabled'}`}
@@ -651,16 +777,18 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
           >
             Session log <IconDownload size={14} />
           </a>
-          <button type="button" className="conversation-header__details" onClick={toggleDetails}>Details</button>
+          {onClose && <button type="button" className="conversation-header__close" aria-label={`Close ${displayTitle}`} title="Close session" onClick={onClose}>×</button>}
         </div>
+        <ContextFill context={context} />
         <div className="conversation-header__tabs" role="tablist" aria-label="Conversation view">
           <button type="button" role="tab" aria-selected={conversationView === 'chat'} className={conversationView === 'chat' ? 'is-active' : ''} onClick={() => setConversationView('chat')}>Chat</button>
           <button type="button" role="tab" aria-selected={conversationView === 'trajectory'} className={conversationView === 'trajectory' ? 'is-active' : ''} onClick={() => setConversationView('trajectory')}>Trajectory</button>
+          <button type="button" role="tab" aria-selected={conversationView === 'backend'} className={conversationView === 'backend' ? 'is-active' : ''} onClick={() => setConversationView('backend')}>Backend log</button>
         </div>
         {streaming && <div className="activity-line" aria-hidden="true" />}
       </div>
 
-      <div className={`conversation-stage${planRail ? ' has-plan-rail' : ''}`}>
+      <div className="conversation-stage">
         <div className="conversation">
           {conversationView === 'chat' ? (
             <div className="conversation__scroll" ref={scrollRef} onScroll={onScroll} role="tabpanel" aria-label="Chat" tabIndex={0}>
@@ -677,19 +805,23 @@ export function Conversation({ tab }: { tab: ConversationTab }) {
                     showActions={responseActionIds.has(row.item.id)}
                   />
                 ))}
+                {!streaming && <TodoTranscript tasks={todos} />}
                 {runningShell
                   ? <ActiveRunIndicator item={runningShell} onInterrupt={interrupt} />
                   : streaming && <ThinkingRow />}
               </div>
             </div>
-          ) : (
+          ) : conversationView === 'trajectory' ? (
             <div className="conversation__scroll conversation__scroll--trajectory" role="tabpanel" aria-label="Trajectory" tabIndex={0}>
               <Trajectory items={timeline.items} />
+            </div>
+          ) : (
+            <div className="conversation__scroll conversation__scroll--backend" role="tabpanel" aria-label="Backend log" tabIndex={0}>
+              <BackendLog entries={timeline.backendLog} live={streaming} />
             </div>
           )}
           {composer}
         </div>
-        {planRail}
       </div>
 
       {viewer && <FileViewer view={viewer} onClose={() => setViewer(null)} />}
@@ -704,6 +836,23 @@ function ThinkingRow() {
       <span className="thinking__spinner" />
       <span>pi is thinking</span>
       <span className="thinking__dots" aria-hidden="true" />
+    </div>
+  )
+}
+
+function ContextFill({ context }: { context: ReturnType<typeof estimateContext> }) {
+  const percent = context.percent ?? 0
+  return (
+    <div
+      className="context-fill"
+      role="progressbar"
+      aria-label={`Context used: ${percent}%`}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent}
+      title={`Approximately ${context.estimatedTokens.toLocaleString()} of ${context.contextWindow.toLocaleString()} context tokens used`}
+    >
+      <span style={{ width: `${percent}%` }} />
     </div>
   )
 }
@@ -738,6 +887,11 @@ function TimelineRow({
       <div className={item.kind === 'rationale' ? 'rationale-text' : undefined}>
         <RichText text={item.kind === 'assistant' ? item.text.replace(/\s*\[DONE:\d+\]\s*/gi, ' ') : item.text} live={item.live} />
       </div>
+      {item.kind === 'assistant' && !item.live && (item.provider || item.modelId) && (
+        <div className="response-model-tag" title="Model that generated this reply, as tracked by the backend — not the model's own self-report.">
+          {item.provider}{item.provider && item.modelId ? '/' : ''}{item.modelId}
+        </div>
+      )}
       {item.kind === 'assistant' && !item.live && showActions && (
         <div className="response-actions" aria-label="Response actions">
           <CopyButton

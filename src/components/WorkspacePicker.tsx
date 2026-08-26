@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { api, type DirectoryListingResponse } from '../lib/api'
+import { api, type AgentBackend, type DirectoryListingResponse } from '../lib/api'
 import { IconChevronDown, IconFolder, IconPlus } from './icons'
 
 const RECENT_WORKSPACES_KEY = 'pi-web.workspaces.v1'
@@ -19,10 +19,12 @@ function storedWorkspaces(): string[] {
 
 export function WorkspacePicker({
   cwd,
+  backend = 'pi',
   disabled,
   onPick,
 }: {
   cwd: string
+  backend?: AgentBackend
   disabled: boolean
   onPick: (path: string) => Promise<void>
 }) {
@@ -145,7 +147,7 @@ export function WorkspacePicker({
             <div className="directory-modal__head">
               <div>
                 <strong>Choose a project directory</strong>
-                <span>Pi will use this folder as its workspace.</span>
+                <span>{backend === 'claude' ? 'Claude' : 'Pi'} will use this folder as its workspace.</span>
               </div>
               <button type="button" aria-label="Close directory picker" onClick={() => setBrowserOpen(false)}>×</button>
             </div>

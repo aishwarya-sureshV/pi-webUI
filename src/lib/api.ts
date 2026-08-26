@@ -1,6 +1,7 @@
 /** Types shared with the pi-web server. */
 
 export type RunStatus = 'stopped' | 'starting' | 'ready' | 'working' | 'error'
+export type AgentBackend = 'pi' | 'claude'
 
 export interface ModelInfo {
   id: string
@@ -20,6 +21,25 @@ export interface SessionState {
   pendingMessageCount: number
 }
 
+export interface UsageWindow {
+  label: string
+  usedPercent: number
+  resetsAt?: string
+}
+
+export interface ProviderUsage {
+  available: boolean
+  provider?: string
+  plan?: string
+  windows: UsageWindow[]
+  tokens?: {
+    input: number
+    output: number
+    total: number
+  }
+  updatedAt?: string
+}
+
 export interface ResumeSession {
   path: string
   name: string
@@ -27,6 +47,10 @@ export interface ResumeSession {
   createdAt: number
   modifiedAt: number
   messageCount: number
+  backend: AgentBackend
+  firstPrompt?: string
+  lastModel?: string
+  lastEffort?: string
 }
 
 export interface SlashCommand {
@@ -120,11 +144,20 @@ export interface AgentEvent {
   [key: string]: unknown
 }
 
-async function post<T = unknown>(url: string, body: unknown): Promise<T> {
+export interface BackendLogEntry {
+  id: string
+  timestamp: number
+  source: string
+  type: string
+  payload: Record<string, unknown>
+}
+
+async function post<T = unknown>(url: string, body: unknown, timeoutMs?: number): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   })
   return (await res.json()) as T
 }
@@ -140,16 +173,27 @@ export const api = {
   directories: (path?: string) =>
     get<DirectoryListingResponse>(`/api/directories${path ? `?path=${encodeURIComponent(path)}` : ''}`),
   sessionLogUrl: (sessionPath: string) => `/api/session-log?path=${encodeURIComponent(sessionPath)}`,
-  sessions: (view: 'recent' | 'archived' = 'recent') =>
-    get<{ ok: boolean; sessions: ResumeSession[] }>(`/api/sessions${view === 'archived' ? '?view=archived' : ''}`),
+  sessionMessages: (sessionPath: string) =>
+    get<{ ok: boolean; messages?: SessionHistoryMessage[]; error?: string }>(`/api/session-messages?path=${encodeURIComponent(sessionPath)}`),
+  sessions: (view: 'recent' | 'archived' = 'recent', backend: AgentBackend = 'pi') => {
+    const params = new URLSearchParams({ backend })
+    if (view === 'archived') params.set('view', 'archived')
+    return get<{ ok: boolean; sessions: ResumeSession[] }>(`/api/sessions?${params}`)
+  },
   archiveSession: (sessionPath: string) =>
     post<SessionMutationResponse>('/api/sessions/archive', { sessionPath }),
   restoreSession: (sessionPath: string) =>
     post<SessionMutationResponse>('/api/sessions/restore', { sessionPath }),
   deleteSession: (sessionPath: string) =>
     post<SessionMutationResponse>('/api/sessions/delete', { sessionPath }),
-  start: (key: string, cwd: string) =>
-    post<{ ok: boolean; state?: SessionState; error?: string }>(`/api/${key}/start`, { cwd }),
+  start: (key: string, cwd: string, backend: AgentBackend = 'pi', model?: ModelInfo, sessionPath?: string, thinkingLevel?: string) =>
+    post<{ ok: boolean; state?: SessionState; messages?: SessionHistoryMessage[]; error?: string }>(`/api/${key}/start`, {
+      cwd,
+      backend,
+      ...(model ? { model } : {}),
+      ...(sessionPath ? { sessionPath } : {}),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    }),
   prompt: (key: string, message: string, images?: ImageAttachment[]) =>
     post<{ ok: boolean; error?: string }>(`/api/${key}/prompt`, { message, images }),
   steer: (key: string, message: string, images?: ImageAttachment[]) =>
@@ -157,7 +201,7 @@ export const api = {
   abort: (key: string) => post<{ ok: boolean; error?: string }>(`/api/${key}/abort`, {}),
   newSession: (key: string) => post<SessionSnapshotResponse>(`/api/${key}/new-session`, {}),
   resume: (key: string, sessionPath: string) =>
-    post<SessionSnapshotResponse>(`/api/${key}/resume`, { sessionPath }),
+    post<SessionSnapshotResponse>(`/api/${key}/resume`, { sessionPath }, 30_000),
   fork: (key: string, timestamp: number) =>
     post<SessionSnapshotResponse>(`/api/${key}/fork`, { timestamp }),
   compact: (key: string, customInstructions?: string) =>
@@ -175,8 +219,10 @@ export const api = {
     model?: ModelInfo | null,
     thinkingLevel?: string,
     sessionPath?: string,
+    backend: AgentBackend = 'pi',
   ) => post<SessionSnapshotResponse>(`/api/${key}/configure`, {
     cwd,
+    backend,
     accessMode,
     agentMode,
     model,
@@ -185,11 +231,21 @@ export const api = {
   }),
   upload: (key: string, name: string, mimeType: string, data: string) =>
     post<{ ok: boolean; path?: string; error?: string }>(`/api/${key}/upload`, { name, mimeType, data }),
-  commands: (key: string) =>
-    get<{ ok: boolean; commands: SlashCommand[] }>(`/api/${key}/commands`),
-  models: (key: string) => get<{ ok: boolean; models: ModelInfo[] }>(`/api/${key}/models`),
-  thinkingLevels: (key: string) =>
-    get<{ ok: boolean; levels: string[] }>(`/api/${key}/thinking-levels`),
+  commands: (key: string, backend?: AgentBackend) =>
+    get<{ ok: boolean; commands: SlashCommand[] }>(`/api/${key}/commands${backend ? `?backend=${backend}` : ''}`),
+  models: (key: string, backend?: AgentBackend) =>
+    get<{ ok: boolean; models: ModelInfo[] }>(`/api/${key}/models${backend ? `?backend=${backend}` : ''}`),
+  thinkingLevels: (key: string, backend?: AgentBackend) =>
+    get<{ ok: boolean; levels: string[] }>(`/api/${key}/thinking-levels${backend ? `?backend=${backend}` : ''}`),
+  usage: (key: string, backend?: AgentBackend, refresh = false) => {
+    const params = new URLSearchParams()
+    if (backend) params.set('backend', backend)
+    if (refresh) params.set('refresh', '1')
+    const query = params.size > 0 ? `?${params}` : ''
+    return get<{ ok: boolean; usage: ProviderUsage; error?: string }>(`/api/${key}/usage${query}`)
+  },
+  backendLog: (key: string) =>
+    get<{ ok: boolean; entries: BackendLogEntry[]; error?: string }>(`/api/${key}/log`),
 }
 
 /** Subscribe to the server event fan-out. */

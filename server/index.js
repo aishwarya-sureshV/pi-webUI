@@ -14,6 +14,7 @@
  *   POST /api/:sessionKey/steer            { message }
  *   POST /api/:sessionKey/abort
  *   POST /api/:sessionKey/stop
+ *   GET  /api/:sessionKey/log
  *   POST /api/:sessionKey/new-session
  *   POST /api/:sessionKey/fork              { timestamp }
  *   POST /api/:sessionKey/compact          { customInstructions? }
@@ -24,14 +25,17 @@
  *   GET  /api/:sessionKey/thinking-levels
  */
 import { createServer } from 'node:http'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, dirname, extname, join, normalize, resolve } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { WebSocketServer } from 'ws'
+import pty from 'node-pty'
 import { PiAgentPool } from './pi-agent.js'
-import { archiveSession, deleteSession, listSessions, loadSessionLog, restoreSession } from './sessions.js'
+import { ClaudeAgentPool } from './claude-agent.js'
+import { archiveSession, deleteSession, listSessions, loadSessionLog, readSessionMessages, restoreSession } from './sessions.js'
 import { loadCatalog } from './catalog.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -43,9 +47,15 @@ const BUILD_ID = existsSync(join(DIST, 'index.html'))
   ? createHash('sha256').update(readFileSync(join(DIST, 'index.html'))).digest('hex').slice(0, 12)
   : 'dev'
 
-const pool = new PiAgentPool()
+const piPool = new PiAgentPool()
+const claudePool = new ClaudeAgentPool()
+/** @type {Map<string, 'pi' | 'claude'>} */
+const sessionBackends = new Map()
 /** @type {Set<import('node:http').ServerResponse>} */
 const sseClients = new Set()
+/** @type {Map<string, Array<{ id: string, timestamp: number, source: string, type: string, payload: object }>>} */
+const runtimeLogs = new Map()
+const MAX_RUNTIME_LOG_ENTRIES = 25_000
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -65,12 +75,111 @@ function broadcast(event) {
   }
 }
 
+function logPayload(event) {
+  if (event && typeof event === 'object' && !Array.isArray(event)) return event
+  return { value: event }
+}
+
+function recordRuntimeEvent(sessionKey, source, event) {
+  const entry = {
+    id: randomUUID(),
+    timestamp: Date.now(),
+    source,
+    type: String(event?.type ?? 'unknown'),
+    payload: logPayload(event),
+  }
+  const entries = runtimeLogs.get(sessionKey) ?? []
+  entries.push(entry)
+  if (entries.length > MAX_RUNTIME_LOG_ENTRIES) entries.splice(0, entries.length - MAX_RUNTIME_LOG_ENTRIES)
+  runtimeLogs.set(sessionKey, entries)
+  return entry
+}
+
+function publishRuntimeEvent(sessionKey, source, event) {
+  const entry = recordRuntimeEvent(sessionKey, source, event)
+  broadcast({
+    ...event,
+    sessionKey,
+    __logId: entry.id,
+    __loggedAt: entry.timestamp,
+    __logSource: source,
+  })
+  return entry
+}
+
+function commandMetadata(body) {
+  const metadata = {}
+  if (body && typeof body.cwd === 'string') metadata.cwd = body.cwd
+  if (body && typeof body.backend === 'string') metadata.backend = backendName(body.backend)
+  if (body && typeof body.message === 'string') metadata.message = body.message
+  if (body?.model && typeof body.model === 'object') {
+    metadata.model = {
+      provider: body.model.provider,
+      id: body.model.id,
+    }
+  }
+  if (body && Array.isArray(body.images)) {
+    metadata.images = body.images.map((image) => ({
+      type: image?.type,
+      mimeType: image?.mimeType,
+      attached: Boolean(image?.data),
+    }))
+  }
+  return metadata
+}
+
+async function runLoggedCommand(sessionKey, action, body, run) {
+  const requestId = randomUUID()
+  publishRuntimeEvent(sessionKey, 'server', {
+    type: 'backend_request',
+    requestId,
+    action,
+    payload: commandMetadata(body),
+  })
+  let result
+  try {
+    result = await run()
+  } catch (error) {
+    result = { ok: false, error: String(error?.message ?? error) }
+  }
+  publishRuntimeEvent(sessionKey, 'server', {
+    type: 'backend_response',
+    requestId,
+    action,
+    ok: Boolean(result?.ok),
+    ...(result?.error ? { error: result.error } : {}),
+    ...(result?.data !== undefined ? { data: result.data } : {}),
+    ...(result?.state !== undefined ? { state: result.state } : {}),
+    ...(Array.isArray(result?.messages) ? { messageCount: result.messages.length } : {}),
+  })
+  return result
+}
+
 // Fan every pool event out to all SSE clients (events carry their sessionKey).
-function watch(sessionKey) {
-  const agent = pool.get(sessionKey)
+function backendName(value) {
+  return value === 'claude' ? 'claude' : 'pi'
+}
+
+// This was previously sent to the active model as ordinary text when it was
+// entered in the composer. It is a display-only shortcut, though: forwarding
+// it starts an unnecessary agent turn (and a stale client can keep doing so).
+function isUsageShortcut(message, images) {
+  return !images?.length && /^\/(?:grok-cli-usage|grok-usage)$/i.test(String(message ?? '').trim())
+}
+
+function poolFor(backend) {
+  return backend === 'claude' ? claudePool : piPool
+}
+
+function watch(sessionKey, requestedBackend) {
+  const backend = requestedBackend === undefined
+    ? (sessionBackends.get(sessionKey) ?? 'pi')
+    : backendName(requestedBackend)
+  sessionBackends.set(sessionKey, backend)
+  const agent = poolFor(backend).get(sessionKey)
   if (!agent.__watched) {
     agent.__watched = true
-    agent.onEvent((event) => broadcast(event))
+    agent.onEvent((event) => publishRuntimeEvent(sessionKey, backend, event))
   }
   return agent
 }
@@ -172,8 +281,15 @@ async function route(req, res) {
     return
   }
 
+  if (pathname === '/api/session-messages' && req.method === 'GET') {
+    return sendJson(res, 200, await readSessionMessages(url.searchParams.get('path') || ''))
+  }
+
   if (pathname === '/api/sessions' && req.method === 'GET') {
-    return sendJson(res, 200, await listSessions({ archived: url.searchParams.get('view') === 'archived' }))
+    return sendJson(res, 200, await listSessions({
+      archived: url.searchParams.get('view') === 'archived',
+      backend: backendName(url.searchParams.get('backend')),
+    }))
   }
 
   if (pathname.startsWith('/api/sessions/') && req.method === 'POST') {
@@ -210,33 +326,60 @@ async function route(req, res) {
   }
   const [, sessionKey, action] = m
 
+  if (req.method === 'GET' && action === 'log') {
+    return sendJson(res, 200, { ok: true, entries: runtimeLogs.get(sessionKey) ?? [] })
+  }
+
   if (req.method === 'POST' && action === 'start') {
     const body = await readBody(req)
-    const agent = watch(sessionKey)
-    const result = await agent.start(body.cwd || process.cwd())
+    const agent = watch(sessionKey, body.backend)
+    const result = await runLoggedCommand(sessionKey, 'start', body, () => agent.start(body.cwd || process.cwd(), {
+      model: body.model && typeof body.model === 'object'
+        ? { provider: String(body.model.provider || ''), id: String(body.model.id || '') }
+        : undefined,
+      sessionPath: typeof body.sessionPath === 'string' && body.sessionPath ? body.sessionPath : undefined,
+      thinkingLevel: typeof body.thinkingLevel === 'string' ? body.thinkingLevel : undefined,
+    }))
     return sendJson(res, result.ok ? 200 : 500, result)
   }
   if (req.method === 'POST' && action === 'prompt') {
     const body = await readBody(req)
-    const result = await watch(sessionKey).prompt(String(body.message ?? ''), Array.isArray(body.images) ? body.images : undefined)
+    const message = String(body.message ?? '')
+    const images = Array.isArray(body.images) ? body.images : undefined
+    if (isUsageShortcut(message, images)) {
+      const result = await runLoggedCommand(sessionKey, 'usage', {}, () => watch(sessionKey).getUsage(true))
+      return sendJson(res, result.ok ? 200 : 500, result)
+    }
+    const result = await runLoggedCommand(sessionKey, 'prompt', body, () =>
+      watch(sessionKey).prompt(message, images),
+    )
     return sendJson(res, result.ok ? 200 : 500, result)
   }
   if (req.method === 'POST' && action === 'steer') {
     const body = await readBody(req)
-    return sendJson(res, 200, await watch(sessionKey).steer(String(body.message ?? ''), Array.isArray(body.images) ? body.images : undefined))
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'steer', body, () =>
+      watch(sessionKey).steer(String(body.message ?? ''), Array.isArray(body.images) ? body.images : undefined),
+    ))
   }
   if (req.method === 'POST' && action === 'abort') {
-    return sendJson(res, 200, await watch(sessionKey).abort())
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'abort', {}, () => watch(sessionKey).abort()))
   }
   if (req.method === 'POST' && action === 'stop') {
-    pool.stop(sessionKey)
-    return sendJson(res, 200, { ok: true })
+    const backend = sessionBackends.get(sessionKey) ?? 'pi'
+    const result = await runLoggedCommand(sessionKey, 'stop', {}, () => {
+      poolFor(backend).stop(sessionKey)
+      sessionBackends.delete(sessionKey)
+      return { ok: true }
+    })
+    return sendJson(res, 200, result)
   }
   if (req.method === 'POST' && action === 'configure') {
     const body = await readBody(req)
-    pool.stop(sessionKey)
-    const agent = watch(sessionKey)
-    const result = await agent.start(String(body.cwd || process.cwd()), {
+    const currentBackend = sessionBackends.get(sessionKey) ?? 'pi'
+    poolFor(currentBackend).stop(sessionKey)
+    sessionBackends.delete(sessionKey)
+    const agent = watch(sessionKey, body.backend)
+    const result = await runLoggedCommand(sessionKey, 'configure', body, () => agent.start(String(body.cwd || process.cwd()), {
       accessMode: body.accessMode === 'read-only' ? 'read-only' : 'workspace-write',
       agentMode: body.agentMode === 'plan' ? 'plan' : 'standard',
       sessionPath: typeof body.sessionPath === 'string' && body.sessionPath ? body.sessionPath : undefined,
@@ -244,7 +387,7 @@ async function route(req, res) {
         ? { provider: String(body.model.provider || ''), id: String(body.model.id || '') }
         : undefined,
       thinkingLevel: typeof body.thinkingLevel === 'string' ? body.thinkingLevel : undefined,
-    })
+    }))
     if (result.ok && body.sessionPath) {
       try { result.messages = await agent.getMessages() }
       catch (error) { return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }) }
@@ -266,32 +409,37 @@ async function route(req, res) {
     return sendJson(res, 200, { ok: true, path })
   }
   if (req.method === 'POST' && action === 'new-session') {
-    return sendJson(res, 200, await watch(sessionKey).newSession())
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'new-session', {}, () => watch(sessionKey).newSession()))
   }
   if (req.method === 'POST' && action === 'resume') {
     const body = await readBody(req)
-    return sendJson(res, 200, await watch(sessionKey).switchSession(String(body.sessionPath ?? '')))
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'resume', body, () => watch(sessionKey).switchSession(String(body.sessionPath ?? ''))))
   }
   if (req.method === 'POST' && action === 'fork') {
     const body = await readBody(req)
-    const result = await watch(sessionKey).forkAt(Number(body.timestamp))
+    const result = await runLoggedCommand(sessionKey, 'fork', body, () => watch(sessionKey).forkAt(Number(body.timestamp)))
     return sendJson(res, result.ok ? 200 : 500, result)
   }
   if (req.method === 'POST' && action === 'compact') {
     const body = await readBody(req)
-    return sendJson(res, 200, await watch(sessionKey).compact(body.customInstructions))
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'compact', body, () => watch(sessionKey).compact(body.customInstructions)))
   }
   if (req.method === 'POST' && action === 'set-model') {
     const body = await readBody(req)
-    return sendJson(res, 200, await watch(sessionKey).setModel(String(body.provider), String(body.modelId)))
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'set-model', body, () => watch(sessionKey).setModel(String(body.provider), String(body.modelId))))
   }
   if (req.method === 'POST' && action === 'set-thinking') {
     const body = await readBody(req)
-    return sendJson(res, 200, await watch(sessionKey).setThinkingLevel(String(body.level)))
+    return sendJson(res, 200, await runLoggedCommand(sessionKey, 'set-thinking', body, () => watch(sessionKey).setThinkingLevel(String(body.level))))
   }
-  if (req.method === 'GET' && action === 'commands') return sendJson(res, 200, await watch(sessionKey).getCommands())
-  if (req.method === 'GET' && action === 'models') return sendJson(res, 200, await watch(sessionKey).getAvailableModels())
-  if (req.method === 'GET' && action === 'thinking-levels') return sendJson(res, 200, await watch(sessionKey).getThinkingLevels())
+  if (req.method === 'GET' && action === 'commands') return sendJson(res, 200, await watch(sessionKey, url.searchParams.get('backend') || undefined).getCommands())
+  if (req.method === 'GET' && action === 'models') return sendJson(res, 200, await watch(sessionKey, url.searchParams.get('backend') || undefined).getAvailableModels())
+  if (req.method === 'GET' && action === 'thinking-levels') return sendJson(res, 200, await watch(sessionKey, url.searchParams.get('backend') || undefined).getThinkingLevels())
+  if (req.method === 'GET' && action === 'usage') {
+    const refresh = url.searchParams.get('refresh') === '1'
+    const result = await watch(sessionKey, url.searchParams.get('backend') || undefined).getUsage(refresh)
+    return sendJson(res, result.ok ? 200 : 500, result)
+  }
 
   return sendJson(res, 404, { ok: false, error: 'unknown route' })
 }
@@ -300,10 +448,61 @@ const server = createServer((req, res) => {
   route(req, res).catch((error) => sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }))
 })
 
+const terminalSockets = new WebSocketServer({ noServer: true })
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`)
+  if (url.pathname !== '/api/terminal') {
+    socket.destroy()
+    return
+  }
+  terminalSockets.handleUpgrade(req, socket, head, (webSocket) => terminalSockets.emit('connection', webSocket, req, url))
+})
+
+terminalSockets.on('connection', (socket, _request, url) => {
+  const requestedCwd = url.searchParams.get('cwd') || homedir()
+  const cwd = existsSync(requestedCwd) && statSync(requestedCwd).isDirectory() ? requestedCwd : homedir()
+  const shell = process.env.SHELL || '/bin/zsh'
+  let terminal
+  try {
+    terminal = pty.spawn(shell, ['-l'], {
+      name: 'xterm-256color',
+      cols: 100,
+      rows: 30,
+      cwd,
+      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    })
+  } catch (error) {
+    socket.send(`\r\n\x1b[31mCould not start the shell: ${String(error?.message ?? error)}\x1b[0m\r\n`)
+    socket.close()
+    return
+  }
+  terminal.onData((data) => {
+    if (socket.readyState === socket.OPEN) socket.send(data)
+  })
+  terminal.onExit(() => socket.close())
+  socket.on('message', (raw) => {
+    let message
+    try { message = JSON.parse(String(raw)) } catch { return }
+    if (message.type === 'input' && typeof message.data === 'string') terminal.write(message.data)
+    if (message.type === 'resize') {
+      const cols = Math.max(2, Math.min(500, Number(message.cols) || 80))
+      const rows = Math.max(1, Math.min(200, Number(message.rows) || 24))
+      terminal.resize(cols, rows)
+    }
+  })
+  socket.on('close', () => terminal.kill())
+})
+
 server.listen(PORT, HOST, () => {
   console.log(`pi-web ready: http://${HOST}:${PORT}`)
 })
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => { pool.stop(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500).unref() })
+  process.on(signal, () => {
+    piPool.stop()
+    claudePool.stop()
+    sessionBackends.clear()
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(0), 1500).unref()
+  })
 }

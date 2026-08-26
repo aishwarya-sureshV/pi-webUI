@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import type { TimelineItem } from '../lib/timeline'
 import { getToolDiff, getToolFileView, summarizeTool, type ToolDiff, type ToolFileView } from '../lib/toolCards'
+import { langFromPath } from '../lib/toolCards'
+import { highlightCode } from '../lib/highlight'
 
 type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
 
@@ -10,6 +12,8 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
   const summary = summarizeTool(item.name, item.args)
   const diff = getToolDiff(item)
   const fileView = getToolFileView(item)
+  const path = String(item.args.path ?? item.args.file_path ?? '')
+  const language = langFromPath(path)
 
   return (
     <article className="tl tl--tool">
@@ -53,7 +57,7 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
             {diff ? (
               <DiffPreview diff={diff} />
             ) : item.output ? (
-              <pre>{item.output}</pre>
+              <pre data-language={language}><code>{highlightCode(item.output, language)}</code></pre>
             ) : (
               <pre>{JSON.stringify(item.args, null, 2)}</pre>
             )}

@@ -8,8 +8,11 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { readCodexRateLimits } from './codex-usage.js'
 
 const CO_PARTNER_PROMPT = [
   'You are working inside a web workbench as a thinking co-partner.',
@@ -33,8 +36,24 @@ const PLAN_MODE_PROMPT = [
   'Do not execute the plan until the user explicitly chooses Execute plan in the interface.',
 ].join('\n')
 
+const USAGE_CACHE_TTL_MS = 5 * 60_000
+
 function resolvePiExecutable() {
   return process.env.PI_WEB_PI_BIN || 'pi'
+}
+
+function usageWindowLabel(seconds) {
+  if (seconds <= 6 * 60 * 60) return 'Current session'
+  if (seconds >= 6 * 24 * 60 * 60 && seconds <= 8 * 24 * 60 * 60) return 'Current week'
+  const hours = Math.round(seconds / 3600)
+  return hours >= 48 ? `${Math.round(hours / 24)} day limit` : `${hours} hour limit`
+}
+
+function formatResetTime(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return undefined
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  }).format(new Date(epochSeconds * 1000))
 }
 
 class PiAgentProcess {
@@ -46,6 +65,9 @@ class PiAgentProcess {
     this.nextRequestId = 1
     this.pending = new Map()
     this.status = 'stopped'
+    this.lastState = undefined
+    this.usageRequest = undefined
+    this.usageCache = { at: 0, result: undefined }
     /** @type {Set<(event: object) => void>} */
     this.listeners = new Set()
   }
@@ -121,7 +143,13 @@ class PiAgentProcess {
       child.once('spawn', resolve)
       child.once('error', reject)
     })
-    const state = await this.getState()
+    let state
+    try {
+      state = await this.getState(15_000)
+    } catch (error) {
+      this.stop()
+      throw new Error(`Pi did not finish starting within 15 seconds: ${String(error?.message ?? error)}`)
+    }
     this.setStatus(state.isStreaming ? 'working' : 'ready')
     return { ok: true, state }
   }
@@ -131,13 +159,30 @@ class PiAgentProcess {
   followUp(message, images) { return this.runCommand({ type: 'follow_up', message, ...(images?.length ? { images } : {}) }) }
   abort() { return this.runCommand({ type: 'abort' }) }
   newSession() { return this.runSessionCommand({ type: 'new_session' }) }
-  switchSession(sessionPath) { return this.runSessionCommand({ type: 'switch_session', sessionPath }) }
+  async switchSession(sessionPath) {
+    const result = await this.runSessionCommand({ type: 'switch_session', sessionPath }, 20_000)
+    if (result.ok) this.usageCache = { at: 0, result: undefined }
+    if (!result.ok || !result.state?.isStreaming) return result
+
+    // A persisted session can contain an interrupted turn from another Pi
+    // process. Never let that stale flag turn a read-only resume into a live
+    // run in the web UI.
+    await this.abort()
+    this.setStatus('ready')
+    try {
+      const [state, messages] = await Promise.all([this.getState(10_000), this.getMessages(10_000)])
+      return { ...result, state: { ...state, isStreaming: false }, messages }
+    } catch {
+      return { ...result, state: { ...result.state, isStreaming: false } }
+    }
+  }
   compact(customInstructions) {
     return this.runCommand({ type: 'compact', ...(customInstructions ? { customInstructions } : {}) })
   }
   async setModel(provider, modelId) {
     const result = await this.runCommand({ type: 'set_model', provider, modelId })
     if (!result.ok) return result
+    this.usageCache = { at: 0, result: undefined }
     try {
       return { ok: true, data: result.data, state: await this.getState() }
     } catch (error) {
@@ -146,14 +191,15 @@ class PiAgentProcess {
   }
   setThinkingLevel(level) { return this.runCommand({ type: 'set_thinking_level', level }) }
 
-  async getState() {
-    const response = await this.send({ type: 'get_state' })
+  async getState(timeoutMs) {
+    const response = await this.send({ type: 'get_state' }, timeoutMs)
     if (response.success === false) throw new Error(response.error ?? 'get_state failed')
-    return response.data
+    this.lastState = response.data
+    return this.lastState
   }
 
-  async getMessages() {
-    const response = await this.send({ type: 'get_messages' })
+  async getMessages(timeoutMs) {
+    const response = await this.send({ type: 'get_messages' }, timeoutMs)
     if (response.success === false) throw new Error(response.error ?? 'get_messages failed')
     const data = response.data
     return Array.isArray(data) ? data : (data?.messages ?? [])
@@ -189,11 +235,11 @@ class PiAgentProcess {
       : this.runSessionCommand({ type: 'clone' })
   }
 
-  async runSessionCommand(command) {
-    const result = await this.runCommand(command)
+  async runSessionCommand(command, timeoutMs) {
+    const result = await this.runCommand(command, timeoutMs)
     if (!result.ok) return result
     try {
-      const [state, messages] = await Promise.all([this.getState(), this.getMessages()])
+      const [state, messages] = await Promise.all([this.getState(timeoutMs), this.getMessages(timeoutMs)])
       return { ok: true, state, messages, data: result.data }
     } catch (error) {
       return { ok: false, error: String(error?.message ?? error) }
@@ -222,23 +268,164 @@ class PiAgentProcess {
     return { ok: true, levels: Array.isArray(data) ? data : (data?.levels ?? []) }
   }
 
-  async runCommand(command) {
+  async getUsage(force = false) {
+    const now = Date.now()
+    if (!force && this.usageCache.result && now - this.usageCache.at < USAGE_CACHE_TTL_MS) {
+      return this.usageCache.result
+    }
+    if (this.usageRequest) return this.usageRequest
+    this.usageRequest = this.loadUsage()
+      .then((result) => {
+        if (result?.ok) this.usageCache = { at: Date.now(), result }
+        return result
+      })
+      .finally(() => { this.usageRequest = undefined })
+    return this.usageRequest
+  }
+
+  async loadUsage() {
+    let state = this.lastState
+    try { state ??= await this.getState(5_000) }
+    catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+    const identity = `${state?.model?.provider ?? ''}/${state?.model?.id ?? ''}`.toLowerCase()
+    if (identity.includes('grok')) return this.loadGrokUsage()
+    if (identity.includes('openai-codex')) return this.loadCodexUsage(state?.model?.id)
+    if (identity.includes('ollama')) return this.loadOllamaUsage()
+    return { ok: true, usage: { available: false, provider: state?.model?.provider ?? 'Provider', windows: [] } }
+  }
+
+  async loadGrokUsage() {
     try {
-      const response = await this.send(command)
+      const grokHome = process.env.GROK_HOME || join(homedir(), '.grok')
+      const auth = JSON.parse(await readFile(join(grokHome, 'auth.json'), 'utf8'))
+      const token = auth?.['https://accounts.x.ai/sign-in']?.key
+        ?? Object.values(auth ?? {}).find((entry) => typeof entry?.key === 'string')?.key
+      if (typeof token !== 'string' || token.length === 0) {
+        return { ok: true, usage: { available: false, provider: 'Grok', windows: [] } }
+      }
+
+      const response = await fetch('https://cli-chat-proxy.grok.com/v1/billing?format=credits', {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          'User-Agent': 'grok-cli',
+          'x-xai-token-auth': 'xai-grok-cli',
+        },
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!response.ok) throw new Error(`Grok usage returned ${response.status}`)
+      const payload = await response.json()
+      const config = payload?.config ?? payload
+      const usedPercent = Number(config?.creditUsagePercent)
+      const resetAt = Date.parse(String(config?.currentPeriod?.end ?? config?.billingPeriodEnd ?? '')) / 1000
+      const resetsAt = formatResetTime(resetAt)
+      const windows = Number.isFinite(usedPercent)
+        ? [{ label: 'Current week', usedPercent, ...(resetsAt ? { resetsAt } : {}) }]
+        : []
+      return {
+        ok: true,
+        usage: {
+          available: windows.length > 0,
+          provider: 'Grok',
+          windows,
+          updatedAt: new Date().toISOString(),
+        },
+      }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) }
+    }
+  }
+
+  async loadCodexUsage(modelId) {
+    try {
+      const payload = await readCodexRateLimits()
+      const normalizedModel = String(modelId ?? '').toLowerCase()
+      const rateLimits = Object.values(payload?.rateLimitsByLimitId ?? {}).filter(Boolean)
+      const selected = normalizedModel.includes('spark')
+        ? rateLimits.find((entry) => `${entry?.limitId ?? ''} ${entry?.limitName ?? ''}`.toLowerCase().includes('spark'))
+        : rateLimits.find((entry) => String(entry?.limitId ?? '').toLowerCase() === 'codex')
+      const limits = selected ?? payload?.rateLimits ?? rateLimits[0]
+      const windows = [limits?.primary, limits?.secondary].filter(Boolean).map((window) => ({
+        label: usageWindowLabel(Number(window.windowDurationMins ?? 0) * 60),
+        usedPercent: Number(window.usedPercent ?? 0),
+        ...(formatResetTime(Number(window.resetsAt)) ? { resetsAt: formatResetTime(Number(window.resetsAt)) } : {}),
+      }))
+      return {
+        ok: true,
+        usage: {
+          available: windows.length > 0,
+          provider: 'Codex',
+          plan: String(limits?.planType ?? '').replace(/(^|_)(\w)/g, (_match, _prefix, letter) => ` ${letter.toUpperCase()}`).trim() || undefined,
+          windows,
+          updatedAt: new Date().toISOString(),
+        },
+      }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) }
+    }
+  }
+
+  async loadOllamaUsage() {
+    try {
+      const messages = await this.getMessages()
+      const tokens = messages.reduce((total, message) => {
+        if (message?.role !== 'assistant' || !message.usage) return total
+        const input = Number(message.usage.input ?? 0)
+        const output = Number(message.usage.output ?? 0)
+        const combined = Number(message.usage.totalTokens ?? input + output)
+        return { input: total.input + input, output: total.output + output, total: total.total + combined }
+      }, { input: 0, output: 0, total: 0 })
+      return {
+        ok: true,
+        usage: {
+          available: tokens.total > 0,
+          provider: 'Ollama',
+          windows: [],
+          ...(tokens.total > 0 ? { tokens } : {}),
+          updatedAt: new Date().toISOString(),
+        },
+      }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) }
+    }
+  }
+
+  async runCommand(command, timeoutMs) {
+    try {
+      const response = await this.send(command, timeoutMs)
       return response.success === false
         ? { ok: false, error: response.error ?? `${command.type} failed` }
         : { ok: true, data: response.data }
     } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
   }
 
-  send(command) {
+  send(command, timeoutMs) {
     if (!this.process) return Promise.reject(new Error('Pi process is not running'))
     const id = `req-${this.nextRequestId++}`
     const payload = { ...command, id }
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const timeout = timeoutMs
+        ? setTimeout(() => {
+            this.pending.delete(id)
+            reject(new Error(`${command.type} timed out`))
+          }, timeoutMs)
+        : undefined
+      this.pending.set(id, {
+        resolve: (value) => {
+          if (timeout) clearTimeout(timeout)
+          resolve(value)
+        },
+        reject: (error) => {
+          if (timeout) clearTimeout(timeout)
+          reject(error)
+        },
+      })
       this.process.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
-        if (error) { this.pending.delete(id); reject(error) }
+        if (error) {
+          this.pending.delete(id)
+          if (timeout) clearTimeout(timeout)
+          reject(error)
+        }
       })
     })
   }
@@ -267,11 +454,18 @@ class PiAgentProcess {
 
   handleLine(line) {
     let event
-    try { event = JSON.parse(line) } catch { return }
+    try { event = JSON.parse(line) } catch {
+      this.emit({ type: 'pi_raw_line', sessionKey: this.sessionKey, raw: line })
+      return
+    }
     if (event.type === 'response' && event.id && this.pending.has(event.id)) {
       const { resolve } = this.pending.get(event.id)
       this.pending.delete(event.id)
       resolve(event)
+      // Responses are part of the RPC lifecycle too. Keep them on the shared
+      // event stream so the backend log can show the command boundary and its
+      // raw acknowledgement, not only the agent's streamed events.
+      this.emit({ ...event, sessionKey: this.sessionKey })
       return
     }
     if (event.type === 'agent_start') this.setStatus('working')

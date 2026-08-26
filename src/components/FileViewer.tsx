@@ -10,7 +10,6 @@ export function FileViewer({ view, onClose }: { view: ToolFileView; onClose: () 
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const big = (view.content?.length ?? 0) > 30000
   return (
     <div className="viewer" onClick={onClose}>
       <div className="viewer__panel" onClick={(e) => e.stopPropagation()}>
@@ -23,11 +22,7 @@ export function FileViewer({ view, onClose }: { view: ToolFileView; onClose: () 
         </div>
         <div className="viewer__scroll">
           {view.content !== undefined ? (
-            big ? (
-              <pre>{view.content}</pre>
-            ) : (
-              <pre><code>{highlightCode(view.content, view.language)}</code></pre>
-            )
+            <pre><code>{highlightCode(view.content, view.language)}</code></pre>
           ) : view.diff ? (
             <DiffPreview diff={view.diff} />
           ) : null}

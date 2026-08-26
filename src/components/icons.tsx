@@ -104,6 +104,15 @@ export function IconPanel({ size = 16 }: { size?: number }) {
   )
 }
 
+export function IconColumns({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.25">
+      <rect x="1.8" y="2.2" width="12.4" height="11.6" rx="2" />
+      <path d="M8 2.5v11" />
+    </svg>
+  )
+}
+
 export function IconNewChat({ size = 16 }: { size?: number }) {
   return (
     <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round">
@@ -226,6 +235,15 @@ export function IconExtension({ size = 16 }: { size?: number }) {
     <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round">
       <path d="M6.2 6.2V3.1M9.8 6.2V3.1M4.8 6.2h6.4v2.2A3.2 3.2 0 0 1 8 11.6a3.2 3.2 0 0 1-3.2-3.2V6.2Z" />
       <path d="M8 11.6v2.2" />
+    </svg>
+  )
+}
+
+export function IconTerminal({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1.7" y="2.2" width="12.6" height="11.6" rx="2" />
+      <path d="m4.2 5.2 2.3 2.1-2.3 2.1M8.2 10h3.2" />
     </svg>
   )
 }

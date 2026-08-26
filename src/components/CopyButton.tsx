@@ -20,7 +20,6 @@ export function CopyButton({
   text,
   label = 'Copy',
   className = '',
-  iconOnly = false,
 }: {
   text: string
   label?: string
@@ -42,7 +41,7 @@ export function CopyButton({
         })
       }}
     >
-      {iconOnly ? (copied ? <IconCheck /> : <IconCopy />) : (copied ? 'Copied' : label)}
+      {copied ? <IconCheck /> : <IconCopy />}
     </button>
   )
 }

@@ -10,15 +10,30 @@ import { Fragment, type ReactNode } from 'react'
  * which keep their plain single-color treatment.
  */
 
+const LANG_ALIASES: Record<string, string> = {
+  javascript: 'js',
+  typescript: 'ts',
+  node: 'js',
+  py: 'python',
+  sh: 'bash',
+  shell: 'bash',
+  zsh: 'bash',
+  yml: 'yaml',
+}
+
 const C_LIKE = new Set([
   'js',
+  'javascript',
   'mjs',
   'cjs',
   'jsx',
   'ts',
+  'typescript',
   'tsx',
   'mts',
   'cts',
+  'json',
+  'jsonc',
   'json5',
   'go',
   'rust',
@@ -299,9 +314,28 @@ function getRegex(lang: string | undefined): RegExp {
   return re
 }
 
+function normalizeLanguage(language: string | undefined): string | undefined {
+  if (!language) return undefined
+  const raw = language.trim().toLowerCase()
+  if (!raw || raw === 'text' || raw === 'plain' || raw === 'plaintext' || raw === 'txt') return undefined
+  return LANG_ALIASES[raw] ?? raw
+}
+
+function canHighlight(language: string | undefined): boolean {
+  if (!language) return false
+  return C_LIKE.has(language)
+    || HASH_LANGS.has(language)
+    || DASH_LANGS.has(language)
+    || MARKUP_LANGS.has(language)
+    || language === 'css'
+}
+
 export function highlightCode(code: string, language: string | undefined): ReactNode[] {
   if (!code) return []
-  const re = getRegex(language)
+  const lang = normalizeLanguage(language)
+  if (!canHighlight(lang)) return [code]
+  const re = getRegex(lang)
+  re.lastIndex = 0
   const nodes: ReactNode[] = []
   let lastIndex = 0
   let match: RegExpExecArray | null
