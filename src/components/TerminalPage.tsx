@@ -78,6 +78,8 @@ export function TerminalPage({
   ]);
   const [activeId, setActiveId] = useState(initialId.current);
   const [statuses, setStatuses] = useState<Record<string, TerminalStatus>>({});
+  // Live working directory per tab, pushed by the server as the shell cd's.
+  const [cwds, setCwds] = useState<Record<string, string>>({});
 
   const addTerminal = () => {
     const id = crypto.randomUUID();
@@ -99,25 +101,68 @@ export function TerminalPage({
       delete next[id];
       return next;
     });
+    setCwds((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
   };
 
   return (
     <section className="terminal-page" aria-label="Terminal">
-      <header className="terminal-page__header">
-        <div className="terminal-page__heading">
-          <strong>Terminal</strong>
+      <div className="terminal-page__tabbar">
+        <div
+          className="terminal-page__tabs"
+          role="tablist"
+          aria-label="Terminal tabs"
+        >
+          {tabs.map((tab) => {
+            const status = statuses[tab.id] ?? "connecting";
+            return (
+              <div
+                className={`terminal-page__tab${tab.id === activeId ? " is-active" : ""}`}
+                key={tab.id}
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={tab.id === activeId}
+                  onClick={() => setActiveId(tab.id)}
+                >
+                  <span className={`terminal-page__tab-status is-${status}`} />
+                  <span>{tab.label}</span>
+                </button>
+                <button
+                  type="button"
+                  className="terminal-page__tab-close"
+                  onClick={() => closeTerminal(tab.id)}
+                  aria-label={`Close ${tab.label}`}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
           <button
             type="button"
-            className="terminal-page__new"
+            className="terminal-page__tab-add"
             onClick={addTerminal}
-            aria-label="New terminal"
+            aria-label="New terminal tab"
             title="New terminal"
           >
             +
           </button>
-          <span className="terminal-page__cwd">{cwd || "Home"}</span>
         </div>
         <div className="terminal-page__actions">
+          <span
+            className="terminal-page__cwd"
+            title={cwds[activeId] ?? cwd ?? "Home"}
+          >
+            {(cwds[activeId] ?? cwd ?? "Home")
+              .split(/[\\/]/)
+              .filter(Boolean)
+              .at(-1) ?? "Home"}
+          </span>
           {pane && (
             <button
               type="button"
@@ -143,48 +188,6 @@ export function TerminalPage({
             </button>
           )}
         </div>
-      </header>
-      <div
-        className="terminal-page__tabs"
-        role="tablist"
-        aria-label="Terminal tabs"
-      >
-        {tabs.map((tab) => {
-          const status = statuses[tab.id] ?? "connecting";
-          return (
-            <div
-              className={`terminal-page__tab${tab.id === activeId ? " is-active" : ""}`}
-              key={tab.id}
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={tab.id === activeId}
-                onClick={() => setActiveId(tab.id)}
-              >
-                <span className={`terminal-page__tab-status is-${status}`} />
-                <span>{tab.label}</span>
-              </button>
-              <button
-                type="button"
-                className="terminal-page__tab-close"
-                onClick={() => closeTerminal(tab.id)}
-                aria-label={`Close ${tab.label}`}
-              >
-                ×
-              </button>
-            </div>
-          );
-        })}
-        <button
-          type="button"
-          className="terminal-page__tab-add"
-          onClick={addTerminal}
-          aria-label="New terminal tab"
-          title="New terminal"
-        >
-          +
-        </button>
       </div>
       <div className="terminal-page__shells">
         {tabs.map((tab) => (
@@ -193,6 +196,13 @@ export function TerminalPage({
             cwd={tab.cwd}
             theme={theme}
             active={tab.id === activeId}
+            onCwd={(value) =>
+              setCwds((current) =>
+                current[tab.id] === value
+                  ? current
+                  : { ...current, [tab.id]: value },
+              )
+            }
             onStatus={(status) =>
               setStatuses((current) =>
                 current[tab.id] === status
@@ -221,11 +231,13 @@ function TerminalSession({
   cwd,
   theme,
   active,
+  onCwd,
   onStatus,
 }: {
   cwd?: string;
   theme: "light" | "dark";
   active: boolean;
+  onCwd: (cwd: string) => void;
   onStatus: (status: TerminalStatus) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -233,10 +245,15 @@ function TerminalSession({
   const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const statusCallbackRef = useRef(onStatus);
+  const cwdCallbackRef = useRef(onCwd);
 
   useEffect(() => {
     statusCallbackRef.current = onStatus;
   }, [onStatus]);
+
+  useEffect(() => {
+    cwdCallbackRef.current = onCwd;
+  }, [onCwd]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -290,9 +307,24 @@ function TerminalSession({
           }),
         );
       });
-      socket.addEventListener("message", (event) =>
-        terminal.write(String(event.data)),
-      );
+      socket.addEventListener("message", (event) => {
+        const data = String(event.data);
+        // Control channel from the server (NUL-prefixed JSON): live shell cwd.
+        if (data.startsWith("\u0000{")) {
+          try {
+            const control = JSON.parse(data.slice(1)) as {
+              type?: string;
+              cwd?: string;
+            };
+            if (control.type === "cwd" && control.cwd)
+              cwdCallbackRef.current(control.cwd);
+          } catch {
+            /* malformed control message; ignore */
+          }
+          return;
+        }
+        terminal.write(data);
+      });
       socket.addEventListener("close", () =>
         statusCallbackRef.current("closed"),
       );

@@ -170,6 +170,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const didOpenInitialSession = useRef(false);
   const didRenderRestoredSessions = useRef(false);
   const tabsRef = useRef<ConversationTab[]>([]);
+  let firstStreamConnect = true;
   const preferredModels = useRef(new Map<string, ModelInfo>());
   const persistedOpenSessions = useRef(
     readOpenSessions(defaultBackend.current),
@@ -217,22 +218,53 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     refreshSessions();
-    const unsubscribe = subscribeEvents((event: AgentEvent) => {
-      const key = event.sessionKey;
-      if (!key) return;
-      const timeline = timelines.get(key);
-      timeline?.handle(event);
-      setWorkingKeys((current) => {
-        const working = timelineIsWorking(timeline);
-        if (working === current.has(key)) return current;
-        const next = new Set(current);
-        if (working) next.add(key);
-        else next.delete(key);
-        return next;
-      });
-      if (event.type === "agent_settled" || event.type === "session_title_set")
-        refreshSessions();
-    });
+    const unsubscribe = subscribeEvents(
+      (event: AgentEvent) => {
+        const key = event.sessionKey;
+        if (!key) return;
+        const timeline = timelines.get(key);
+        timeline?.handle(event);
+        setWorkingKeys((current) => {
+          const working = timelineIsWorking(timeline);
+          if (working === current.has(key)) return current;
+          const next = new Set(current);
+          if (working) next.add(key);
+          else next.delete(key);
+          return next;
+        });
+        if (
+          event.type === "agent_settled" ||
+          event.type === "session_title_set"
+        )
+          refreshSessions();
+      },
+      (status) => {
+        // Self-heal after a stream drop (server restart, network blip): a
+        // mid-turn "working" flag can otherwise stick forever, because the
+        // completion event is lost with the connection. On re-connect, ask
+        // the server for each open session's true state and correct the
+        // timeline. The first connect is skipped — tabs hydrate themselves
+        // on mount and an optimistic pending run must not be clobbered.
+        if (status !== "connected") return;
+        if (firstStreamConnect) {
+          firstStreamConnect = false;
+          return;
+        }
+        for (const tab of tabsRef.current) {
+          void api
+            .sessionState(tab.key, tab.backend)
+            .then((result) => {
+              const timeline = timelines.get(tab.key);
+              if (!timeline) return;
+              if (result.state) timeline.setState(result.state);
+              else timeline.clearPendingRun();
+            })
+            .catch(() => {
+              /* server unreachable again; next reconnect retries */
+            });
+        }
+      },
+    );
     return unsubscribe;
   }, [refreshSessions]);
 

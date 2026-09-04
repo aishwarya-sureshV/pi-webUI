@@ -37,6 +37,7 @@ import {
   mkdir,
   open as openFile,
   readdir,
+  readlink,
   rename,
   rm,
   cp,
@@ -1721,7 +1722,27 @@ async function route(req, res) {
                 maxBuffer: 4 * 1024 * 1024,
               });
             const out = [];
-            await run(["add", "-A"]);
+            // Optional file selection: when the client sends `files`, stage
+            // only those (paths are repo-relative and validated); otherwise
+            // stage everything. Unselected files stay in the working tree.
+            const files = Array.isArray(body.files)
+              ? body.files.filter((f) => typeof f === "string" && f)
+              : undefined;
+            if (files) {
+              if (files.length === 0)
+                return { ok: false, error: "No files selected." };
+              for (const file of files) {
+                if (
+                  isAbsolute(file) ||
+                  file.split(/[\\/]/).includes("..") ||
+                  file.startsWith(":")
+                )
+                  return { ok: false, error: `Invalid file path: ${file}` };
+              }
+              await run(["add", "--", ...files]);
+            } else {
+              await run(["add", "-A"]);
+            }
             try {
               const commit = await run(["commit", "-m", message]);
               out.push(`${commit.stdout}${commit.stderr}`.trim());
@@ -1796,6 +1817,20 @@ async function route(req, res) {
         watch(sessionKey).setThinkingLevel(String(body.level)),
       ),
     );
+  }
+  if (req.method === "GET" && action === "state") {
+    // Live state snapshot for the stream-reconnect self-heal: after the SSE
+    // connection drops, the UI asks whether a mid-turn "working" flag is
+    // still true instead of trusting its stale local copy.
+    try {
+      const state = await watch(
+        sessionKey,
+        url.searchParams.get("backend") || undefined,
+      ).getState();
+      return sendJson(res, 200, { ok: true, state: state ?? null });
+    } catch {
+      return sendJson(res, 200, { ok: true, state: null });
+    }
   }
   if (req.method === "GET" && action === "commands")
     return sendJson(
@@ -1902,7 +1937,42 @@ terminalSockets.on("connection", (socket, _request, url) => {
   terminal.onData((data) => {
     if (socket.readyState === socket.OPEN) socket.send(data);
   });
-  terminal.onExit(() => socket.close());
+  terminal.onExit(() => {
+    clearInterval(cwdTimer);
+    socket.close();
+  });
+
+  // Track the shell's live working directory (cd inside the terminal moves
+  // the SHELL process, not the spawned cwd) and push it to the UI. Control
+  // messages are prefixed with NUL — real terminal output never starts a
+  // chunk with NUL + '{'. Polling: /proc on Linux, lsof on macOS.
+  let lastCwd = cwd;
+  const pushCwd = async () => {
+    try {
+      let cwdNow;
+      if (process.platform === "darwin") {
+        const { stdout } = await execFileAsync(
+          "lsof",
+          ["-a", "-p", String(terminal.pid), "-d", "cwd", "-Fn"],
+          { timeout: 5_000 },
+        );
+        const line = String(stdout)
+          .split("\n")
+          .find((row) => row.startsWith("n/"));
+        cwdNow = line ? line.slice(1) : undefined;
+      } else {
+        cwdNow = await readlink(join("/proc", String(terminal.pid), "cwd"));
+      }
+      if (cwdNow && cwdNow !== lastCwd && socket.readyState === socket.OPEN) {
+        lastCwd = cwdNow;
+        socket.send(`\u0000${JSON.stringify({ type: "cwd", cwd: cwdNow })}`);
+      }
+    } catch {
+      /* shell exited or lsof unavailable; the interval just no-ops */
+    }
+  };
+  const cwdTimer = setInterval(() => void pushCwd(), 3_000);
+  setTimeout(() => void pushCwd(), 500);
   socket.on("message", (raw) => {
     let message;
     try {
@@ -1918,7 +1988,10 @@ terminalSockets.on("connection", (socket, _request, url) => {
       terminal.resize(cols, rows);
     }
   });
-  socket.on("close", () => terminal.kill());
+  socket.on("close", () => {
+    clearInterval(cwdTimer);
+    terminal.kill();
+  });
 });
 
 server.listen(PORT, HOST, () => {

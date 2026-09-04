@@ -477,10 +477,19 @@ export const api = {
     get<{ ok: boolean; diff?: string; error?: string }>(
       `/api/${key}/git-changes?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}`,
     ),
-  gitCommitPush: (key: string, cwd: string, message: string) =>
+  sessionState: (key: string, backend?: AgentBackend) =>
+    get<{ ok: boolean; state?: SessionState | null }>(
+      `/api/${key}/state${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`,
+    ),
+  gitCommitPush: (
+    key: string,
+    cwd: string,
+    message: string,
+    files?: string[],
+  ) =>
     post<{ ok: boolean; output?: string; error?: string }>(
       `/api/${key}/git`,
-      { cwd, op: "commit-push", message },
+      { cwd, op: "commit-push", message, ...(files ? { files } : {}) },
       120_000,
     ),
   compact: (key: string, customInstructions?: string) =>
@@ -573,6 +582,7 @@ export const api = {
  */
 export function subscribeEvents(
   onEvent: (event: AgentEvent) => void,
+  onStatus?: (status: "connected" | "reconnecting") => void,
 ): () => void {
   let source: EventSource | null = null;
   let closed = false;
@@ -592,6 +602,7 @@ export function subscribeEvents(
       }
     }
     source = new EventSource(url);
+    source.onopen = () => onStatus?.("connected");
     source.onmessage = (message) => {
       try {
         onEvent(JSON.parse(message.data) as AgentEvent);
@@ -600,6 +611,7 @@ export function subscribeEvents(
       }
     };
     source.onerror = () => {
+      onStatus?.("reconnecting");
       source?.close();
       retryTimer = window.setTimeout(() => {
         void connect();

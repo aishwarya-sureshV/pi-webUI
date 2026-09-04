@@ -74,7 +74,48 @@ export function ChangesPanel({
     ok?: boolean;
     text?: string;
   }>({ busy: false });
+  // Stays on screen after a successful push (which empties the change list)
+  // so the outcome is visible in-app instead of only on GitHub.
+  const [pushed, setPushed] = useState<{
+    branch?: string;
+    output?: string;
+    files: number;
+  } | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+  // Files the user unchecked. Persisted per repo so the exclusion survives
+  // pushes AND future turns' change boxes until the user re-includes them.
+  const excludedKey = `pi-web.changes-excluded:${cwd || "default"}`;
+  const [excluded, setExcluded] = useState<ReadonlySet<string>>(new Set());
+  const saveExcluded = useCallback(
+    (next: ReadonlySet<string>) => {
+      try {
+        localStorage.setItem(excludedKey, JSON.stringify([...next]));
+      } catch {
+        /* storage unavailable; exclusion lasts this session only */
+      }
+    },
+    [excludedKey],
+  );
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(excludedKey);
+      setExcluded(new Set(raw ? (JSON.parse(raw) as string[]) : []));
+    } catch {
+      setExcluded(new Set());
+    }
+  }, [excludedKey]);
+  const toggleExcluded = useCallback(
+    (path: string) => {
+      setExcluded((current) => {
+        const next = new Set(current);
+        if (next.has(path)) next.delete(path);
+        else next.add(path);
+        saveExcluded(next);
+        return next;
+      });
+    },
+    [saveExcluded],
+  );
   const wasStreaming = useRef(streaming);
   const fetchToken = useRef(0);
 
@@ -82,7 +123,18 @@ export function ChangesPanel({
     const token = ++fetchToken.current;
     try {
       const result = await api.gitChanges(sessionKey, cwd || "");
-      if (token === fetchToken.current) setData(result);
+      if (token === fetchToken.current) {
+        setData(result);
+        // Prune exclusions whose files left the working tree (committed
+        // elsewhere, reverted); the rest stay unchecked across turns.
+        const paths = new Set((result.changes ?? []).map((c) => c.path));
+        setExcluded((current) => {
+          const next = new Set([...current].filter((p) => paths.has(p)));
+          if (next.size === current.size) return current;
+          saveExcluded(next);
+          return next;
+        });
+      }
     } catch {
       /* offline or unauthed; keep the previous snapshot */
     }
@@ -102,6 +154,7 @@ export function ChangesPanel({
       setDismissed(false);
       setOpenFile(null);
       setDiffs({});
+      setPushed(null);
       setReloadToken((token) => token + 1);
     }
   }, [streaming]);
@@ -130,18 +183,35 @@ export function ChangesPanel({
 
   const pushToGithub = async () => {
     if (push.busy) return;
+    const included = changes
+      .filter((change) => !excluded.has(change.path))
+      .map((change) => change.path);
+    if (included.length === 0) {
+      setPush({
+        busy: false,
+        ok: false,
+        text: "No files selected — uncheck nothing or re-include a file first.",
+      });
+      return;
+    }
     setPush({ busy: true });
     try {
       const result = await api.gitCommitPush(
         sessionKey,
         cwd || "",
         message.trim() || "Update from pi-web",
+        included,
       );
       if (result.ok) {
         setPush({
           busy: false,
           ok: true,
-          text: "Committed and pushed to GitHub.",
+          text: `Committed and pushed ${included.length} file${included.length === 1 ? "" : "s"} to GitHub.`,
+        });
+        setPushed({
+          branch: data?.branch,
+          output: result.output,
+          files: included.length,
         });
         setMessage("");
         setOpenFile(null);
@@ -164,8 +234,42 @@ export function ChangesPanel({
   };
 
   const changes = data?.changes ?? [];
-  if (!data?.repo || !data.connected || changes.length === 0 || dismissed)
-    return null;
+  if (!data?.repo || !data.connected || dismissed) return null;
+
+  // Working tree is clean right after a push: keep a success card up so the
+  // outcome (commit + push output) is visible without leaving the app.
+  if (changes.length === 0) {
+    if (!pushed) return null;
+    return (
+      <section
+        className="changes changes--pushed"
+        aria-label="Pushed to GitHub"
+      >
+        <header className="changes__head">
+          <span className="changes__check" aria-hidden>
+            ✓
+          </span>
+          <strong>Pushed to GitHub</strong>
+          <span className="changes__meta">
+            {pushed.branch && `${pushed.branch} · `}
+            {pushed.files} file{pushed.files === 1 ? "" : "s"}
+          </span>
+          <button
+            type="button"
+            className="changes__dismiss"
+            aria-label="Dismiss"
+            title="Dismiss"
+            onClick={() => setDismissed(true)}
+          >
+            ×
+          </button>
+        </header>
+        {pushed.output && (
+          <pre className="changes__output">{pushed.output.slice(0, 800)}</pre>
+        )}
+      </section>
+    );
+  }
 
   return (
     <section className="changes" aria-label="Code changes">
@@ -188,26 +292,36 @@ export function ChangesPanel({
       <ul className="changes__files">
         {changes.map((change) => (
           <li key={change.path}>
-            <button
-              type="button"
-              className="changes__file"
-              aria-expanded={openFile === change.path}
-              onClick={() => void toggleFile(change.path)}
-            >
-              <span
-                className={`changes__status is-${change.status}`}
-                title={change.status}
+            <div className="changes__file">
+              <input
+                type="checkbox"
+                className="changes__file-check"
+                checked={!excluded.has(change.path)}
+                onChange={() => toggleExcluded(change.path)}
+                aria-label={`Commit ${change.path}`}
+                disabled={push.busy}
+              />
+              <button
+                type="button"
+                className="changes__file-toggle"
+                aria-expanded={openFile === change.path}
+                onClick={() => void toggleFile(change.path)}
               >
-                {STATUS_LETTER[change.status]}
-              </span>
-              <span className="changes__path" title={change.path}>
-                {change.path}
-              </span>
-              <span className="changes__stats">
-                <b>+{change.additions}</b>
-                <i>−{change.deletions}</i>
-              </span>
-            </button>
+                <span
+                  className={`changes__status is-${change.status}`}
+                  title={change.status}
+                >
+                  {STATUS_LETTER[change.status]}
+                </span>
+                <span className="changes__path" title={change.path}>
+                  {change.path}
+                </span>
+                <span className="changes__stats">
+                  <b>+{change.additions}</b>
+                  <i>−{change.deletions}</i>
+                </span>
+              </button>
+            </div>
             {openFile === change.path &&
               (diffs[change.path] ? (
                 <div className="changes__diff">
@@ -235,9 +349,18 @@ export function ChangesPanel({
           type="button"
           className="changes__push"
           onClick={() => void pushToGithub()}
-          disabled={push.busy}
+          disabled={
+            push.busy || changes.every((change) => excluded.has(change.path))
+          }
+          title={
+            changes.every((change) => excluded.has(change.path))
+              ? "No files selected"
+              : undefined
+          }
         >
-          {push.busy ? "Pushing…" : "Push to GitHub"}
+          {push.busy
+            ? "Pushing…"
+            : `Push to GitHub (${changes.filter((c) => !excluded.has(c.path)).length})`}
         </button>
       </footer>
       {push.text && (

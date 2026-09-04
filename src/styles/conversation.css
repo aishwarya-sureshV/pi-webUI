@@ -1579,10 +1579,11 @@
 /* Two tool calls back-to-back (edit followed by edit, etc.) read as one
    merged blob at the base row spacing — give them a little air. This also
    covers a tool card directly followed by its shell-command summary chip:
-   the chip's own -2px top margin would otherwise pull it against the card. */
+   the chip's own -2px top margin would otherwise pull it against the card.
+   9px = -1px between tools, per design feedback. */
 .tl--tool + .tl--tool,
 .tl--tool + .tool-summary {
- margin-top: 10px;
+ margin-top: 6px;
 }
 .rich-text strong {
  color: var(--dsw-alias-state-business-primary);
@@ -2017,7 +2018,9 @@
  display: flex;
  flex-wrap: wrap;
  gap: 8px;
- margin: -1px 0 2px 22px;
+ /* Final-output seam: narration text -> collapsed shell-command pill.
+    Bottom margin: pill -> next block, +2px per design feedback. */
+ margin: 2px 0 4px 22px;
 }
 .tool-summary__chip {
  display: inline-flex;
@@ -3713,18 +3716,37 @@ body[data-ds-dark-theme] .conversation-stage .rich-text :not(pre) > code {
 }
 .changes__file {
  display: flex;
+ align-items: stretch;
+ min-height: 30px;
+}
+.changes__file:hover {
+ background: var(--dsw-alias-interactive-bg-hover);
+}
+.changes__file-check {
+ display: block;
+ flex: none;
+ align-self: center;
+ width: 13px;
+ height: 13px;
+ margin: 0 0 0 12px;
+ accent-color: var(--dsw-alias-state-business-primary, #b05d13);
+ cursor: pointer;
+}
+.changes__file-check:disabled {
+ cursor: default;
+}
+.changes__file-toggle {
+ display: flex;
  align-items: center;
  gap: 10px;
- width: 100%;
+ flex: 1;
+ min-width: 0;
  min-height: 30px;
- padding: 2px 14px;
+ padding: 2px 14px 2px 8px;
  border: 0;
  background: transparent;
  text-align: left;
  cursor: pointer;
-}
-.changes__file:hover {
- background: var(--dsw-alias-interactive-bg-hover);
 }
 .changes__status {
  display: grid;
@@ -3846,6 +3868,33 @@ body[data-ds-dark-theme] .conversation-stage .rich-text :not(pre) > code {
 }
 .changes__message.is-error {
  color: var(--ds-status-error, #a4392e);
+ white-space: pre-wrap;
+ word-break: break-word;
+}
+.changes--pushed .changes__head strong {
+ color: var(--ds-status-success, #2f7d44);
+}
+.changes__check {
+ display: grid;
+ place-items: center;
+ flex: none;
+ width: 18px;
+ height: 18px;
+ border-radius: 50%;
+ color: #fffdf7;
+ background: var(--ds-status-success, #2f7d44);
+ font-size: 11px;
+ font-weight: 700;
+}
+.changes__output {
+ margin: 0;
+ padding: 6px 14px;
+ max-height: 132px;
+ overflow: auto;
+ color: var(--dsw-alias-label-secondary);
+ font-family: var(--ds-font-family-code, ui-monospace, Menlo, monospace);
+ font-size: 10px;
+ line-height: 1.5;
  white-space: pre-wrap;
  word-break: break-word;
 }
