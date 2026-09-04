@@ -28,7 +28,7 @@ Rules that hold in every lane:
 
 - **Form the hypothesis before the first Read.** Name the file *and* the symbol
   *and* the mechanism. A candidate you can't name a mechanism for isn't one.
-- This repo is ~48 tracked files. The full tree plus every grep hit fits in a
+- This repo is ~50 tracked files. The full tree plus every grep hit fits in a
   single tool result — so localization costs one bash call, and there is never a
   reason to discover the file list incrementally.
 - **Delta debugging returns a commit, not 45k of context.** If it's a regression,
