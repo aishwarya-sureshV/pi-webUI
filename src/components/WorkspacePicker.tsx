@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { api, type AgentBackend, type DirectoryListingResponse } from '../lib/api'
-import { IconChevronDown, IconFolder, IconPlus } from './icons'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type FormEvent } from 'react'
+import { api, backendLabel, type AgentBackend, type DirectoryListingResponse } from '../lib/api'
+import { IconChevronDown, IconCode, IconFolder, IconPlus } from './icons'
+
+export type WorkspacePickerHandle = { openBrowser: () => void }
 
 const RECENT_WORKSPACES_KEY = 'pi-web.workspaces.v1'
 
@@ -17,17 +19,21 @@ function storedWorkspaces(): string[] {
   }
 }
 
-export function WorkspacePicker({
-  cwd,
-  backend = 'pi',
-  disabled,
-  onPick,
-}: {
+export const WorkspacePicker = forwardRef<WorkspacePickerHandle, {
   cwd: string
   backend?: AgentBackend
   disabled: boolean
   onPick: (path: string) => Promise<void>
-}) {
+  onViewWorkspace?: () => void
+  hideTrigger?: boolean
+}>(function WorkspacePicker({
+  cwd,
+  backend = 'pi',
+  disabled,
+  onPick,
+  onViewWorkspace,
+  hideTrigger = false,
+}, ref) {
   const rootRef = useRef<HTMLDivElement | null>(null)
   const [open, setOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)
@@ -104,8 +110,10 @@ export function WorkspacePicker({
     void navigate(cwd)
   }
 
+  useImperativeHandle(ref, () => ({ openBrowser }))
+
   return (
-    <div className="workspace-picker" ref={rootRef}>
+    <div className="workspace-picker" ref={rootRef} hidden={hideTrigger && !browserOpen ? true : undefined}>
       <button
         type="button"
         className="workspace-picker__trigger"
@@ -132,6 +140,19 @@ export function WorkspacePicker({
             ))}
           </div>
           <div className="workspace-picker__footer">
+            {onViewWorkspace && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false)
+                  onViewWorkspace()
+                }}
+              >
+                <IconCode size={16} />
+                <span>View workspace</span>
+              </button>
+            )}
             <button type="button" role="menuitem" onClick={openBrowser}>
               <IconPlus size={16} />
               <span>Add workspace…</span>
@@ -147,7 +168,7 @@ export function WorkspacePicker({
             <div className="directory-modal__head">
               <div>
                 <strong>Choose a project directory</strong>
-                <span>{backend === 'claude' ? 'Claude' : 'Pi'} will use this folder as its workspace.</span>
+                <span>{backendLabel(backend)} will use this folder as its workspace.</span>
               </div>
               <button type="button" aria-label="Close directory picker" onClick={() => setBrowserOpen(false)}>×</button>
             </div>
@@ -187,4 +208,4 @@ export function WorkspacePicker({
       )}
     </div>
   )
-}
+})

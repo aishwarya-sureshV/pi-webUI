@@ -1,49 +1,8 @@
 import { useState } from 'react'
-import type { TimelineItem } from '../lib/timeline'
+import { extractTodos, type TodoTask } from '../lib/todos'
 
-export type TodoTask = {
-  id: number
-  subject: string
-  status: 'pending' | 'in_progress' | 'completed' | 'deleted'
-  activeForm?: string
-  blockedBy?: number[]
-}
-
-function asTask(value: unknown): TodoTask | null {
-  if (!value || typeof value !== 'object') return null
-  const record = value as Record<string, unknown>
-  const id = Number(record.id)
-  const subject = typeof record.subject === 'string' ? record.subject.trim() : ''
-  const status = String(record.status ?? '') as TodoTask['status']
-  if (!Number.isFinite(id) || !subject || !['pending', 'in_progress', 'completed', 'deleted'].includes(status)) return null
-  return {
-    id,
-    subject,
-    status,
-    ...(typeof record.activeForm === 'string' ? { activeForm: record.activeForm } : {}),
-    ...(Array.isArray(record.blockedBy) ? { blockedBy: record.blockedBy.map(Number).filter(Number.isFinite) } : {}),
-  }
-}
-
-/** Read the latest persisted snapshot emitted by the installed todo tool. */
-export function extractTodos(items: TimelineItem[]): TodoTask[] {
-  let latest: TodoTask[] = []
-  for (const item of items) {
-    if (item.kind !== 'tool' || !item.name.toLowerCase().includes('todo')) continue
-    const rawTasks = Array.isArray(item.details.tasks)
-      ? item.details.tasks
-      : Array.isArray(item.details.todos)
-        ? item.details.todos
-        : []
-    if (rawTasks.length === 0 && item.details.action === 'clear') {
-      latest = []
-      continue
-    }
-    const snapshot = rawTasks.map(asTask).filter((task): task is TodoTask => task !== null)
-    if (snapshot.length > 0 || rawTasks.length === 0 && item.details.action) latest = snapshot
-  }
-  return latest.filter((task) => task.status !== 'deleted')
-}
+export type { TodoTask }
+export { extractTodos }
 
 function taskGlyph(task: TodoTask): string {
   if (task.status === 'completed') return '✓'

@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from 'react'
+import { cloneElement, Fragment, isValidElement, type ReactNode } from 'react'
 
 /**
  * Tiny, dependency-free syntax highlighter for prose (markdown) code blocks
@@ -369,4 +369,82 @@ export function highlightCode(code: string, language: string | undefined): React
     nodes.push(<Fragment key={`t${key++}`}>{code.slice(lastIndex)}</Fragment>)
   }
   return nodes
+}
+
+/** Split highlighted output into one node array per source line. */
+export function splitCodeLines(nodes: ReactNode[]): ReactNode[][] {
+  return splitWithKey(nodes, { n: 0 })
+}
+
+function splitWithKey(nodes: ReactNode[], key: { n: number }): ReactNode[][] {
+  const lines: ReactNode[][] = [[]]
+  const pushText = (text: string) => {
+    const parts = text.split('\n')
+    parts.forEach((part, index) => {
+      if (index > 0) lines.push([])
+      if (part) lines[lines.length - 1]!.push(<Fragment key={`s${key.n++}`}>{part}</Fragment>)
+    })
+  }
+  const walk = (node: ReactNode): void => {
+    if (node === null || node === undefined || typeof node === 'boolean') return
+    if (typeof node === 'string' || typeof node === 'number') {
+      pushText(String(node))
+      return
+    }
+    if (Array.isArray(node)) {
+      node.forEach(walk)
+      return
+    }
+    if (isValidElement<{ children?: ReactNode }>(node)) {
+      const children = node.props.children
+      if (children === null || children === undefined) return
+      const childLines = splitWithKey(Array.isArray(children) ? children : [children], key)
+      childLines.forEach((childLine, index) => {
+        if (index > 0) lines.push([])
+        if (childLine.length > 0) {
+          lines[lines.length - 1]!.push(cloneElement(node, { key: `c${key.n++}` }, childLine))
+        }
+      })
+      return
+    }
+    lines[lines.length - 1]!.push(node)
+  }
+  nodes.forEach(walk)
+  return lines
+}
+
+/** Code block with a line-number gutter. `startAt` offsets numbering (diff hunks). */
+export function NumberedCode({
+  code,
+  language,
+  startAt = 1,
+  highlight = true,
+  className,
+}: {
+  code: string
+  language?: string
+  startAt?: number
+  highlight?: boolean
+  className?: string
+}) {
+  const source = (code ?? '').replace(/\r\n/g, '\n')
+  const rows = splitCodeLines(highlight ? highlightCode(source, language) : [source])
+  const width = String(startAt + Math.max(rows.length, 1) - 1).length
+  return (
+    <pre
+      className={`code-numbered${className ? ` ${className}` : ''}`}
+      {...(language ? { 'data-language': language } : {})}
+    >
+      <code>
+        {rows.map((row, index) => (
+          <span className="code-line" key={index}>
+            <span className="code-line__no" aria-hidden="true" style={{ minWidth: `${width}ch` }}>
+              {startAt + index}
+            </span>
+            <span className="code-line__text">{row.length > 0 ? row : '\u00a0'}</span>
+          </span>
+        ))}
+      </code>
+    </pre>
+  )
 }

@@ -1,18 +1,28 @@
 import { useState } from 'react'
 import type { TimelineItem } from '../lib/timeline'
-import { getToolDiff, getToolFileView, summarizeTool, type ToolDiff, type ToolFileView } from '../lib/toolCards'
+import {
+  displayToolName,
+  getToolDiff,
+  getToolFileView,
+  isFileEditTool,
+  summarizeTool,
+  toolPath,
+  type ToolDiff,
+  type ToolFileView,
+} from '../lib/toolCards'
 import { langFromPath } from '../lib/toolCards'
-import { highlightCode } from '../lib/highlight'
+import { NumberedCode } from '../lib/highlight'
 
 type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
 
 export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (view: ToolFileView) => void }) {
-  const [open, setOpen] = useState(item.name === 'edit' || item.name === 'write')
+  const shownName = displayToolName(item.name)
+  const [open, setOpen] = useState(isFileEditTool(item.name))
 
   const summary = summarizeTool(item.name, item.args)
   const diff = getToolDiff(item)
   const fileView = getToolFileView(item)
-  const path = String(item.args.path ?? item.args.file_path ?? '')
+  const path = toolPath(item.args)
   const language = langFromPath(path)
 
   return (
@@ -22,7 +32,7 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
         <div className="tool__head">
           <button type="button" className="tool__toggle" onClick={() => setOpen((v) => !v)}>
             <span>{open ? '▼' : '▶'}</span>
-            <em>{item.name}</em>
+            <em title={shownName !== item.name ? item.name : undefined}>{shownName}</em>
             <strong>{summary}</strong>
             {diff && (
               <span className="diff-stats" aria-label={`${diff.added} added, ${diff.removed} removed`}>
@@ -57,9 +67,9 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
             {diff ? (
               <DiffPreview diff={diff} />
             ) : item.output ? (
-              <pre data-language={language}><code>{highlightCode(item.output, language)}</code></pre>
+              <NumberedCode code={item.output} language={language} />
             ) : (
-              <pre>{JSON.stringify(item.args, null, 2)}</pre>
+              <NumberedCode code={JSON.stringify(item.args, null, 2)} language="json" />
             )}
           </div>
         )}
@@ -69,11 +79,18 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
 }
 
 export function DiffPreview({ diff }: { diff: ToolDiff }) {
+  const numbered = diff.lines.some((line) => line.lineNo != null)
+  const width = String(Math.max(0, ...diff.lines.map((line) => line.lineNo ?? 0))).length
   return (
     <div className="diff">
       {diff.lines.map((line, index) => (
         <div key={`${index}-${line.text}`} className={`diff__line is-${line.kind}`}>
-          <span>{line.kind === 'add' ? '+' : line.kind === 'remove' ? '−' : ' '}</span>
+          {numbered && (
+            <span className="diff__no" aria-hidden="true" style={{ minWidth: `${width}ch` }}>
+              {line.kind === 'meta' ? '' : line.lineNo ?? ''}
+            </span>
+          )}
+          <span className="diff__mark">{line.kind === 'add' ? '+' : line.kind === 'remove' ? '−' : ' '}</span>
           <code>{line.text}</code>
         </div>
       ))}

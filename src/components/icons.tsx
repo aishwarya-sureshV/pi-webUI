@@ -265,3 +265,37 @@ export function IconRefresh({ size = 16 }: { size?: number }) {
     </svg>
   )
 }
+
+export function IconCode({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6.2 3.5 2.8 8l3.4 4.5M9.8 3.5 13.2 8l-3.4 4.5" />
+    </svg>
+  )
+}
+
+export function IconInfo({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round">
+      <circle cx="8" cy="8" r="5.4" />
+      <path d="M8 7.2V11M8 5.2v.2" />
+    </svg>
+  )
+}
+
+export function IconPencil({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.2 3.4 12.6 6.8 6 13.4H2.6V10z" />
+      <path d="M8 4.6 11.4 8" />
+    </svg>
+  )
+}
+
+export function IconExpand({ size = 16 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.5 3.2H12.8V6.5M6.5 12.8H3.2V9.5M12.8 3.2 9.2 6.8M3.2 12.8 6.8 9.2" />
+    </svg>
+  )
+}

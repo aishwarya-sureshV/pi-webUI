@@ -1,5 +1,5 @@
 import { memo, type JSX, type ReactNode } from 'react'
-import { highlightCode } from '../lib/highlight'
+import { highlightCode, NumberedCode } from '../lib/highlight'
 import { CopyButton } from './CopyButton'
 
 type Segment =
@@ -22,9 +22,7 @@ export const RichText = memo(function RichText({ text, live = false }: { text: s
 function CodeBlock({ code, language }: { code: string; language?: string }) {
   return (
     <div className="md-code-block">
-      <pre data-language={language}>
-        <code>{highlightCode(code, language)}</code>
-      </pre>
+      <NumberedCode code={code} language={language} />
       <CopyButton text={code} label="Copy command" className="md-code-block__copy" iconOnly />
     </div>
   )

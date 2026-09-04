@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { TimelineItem } from '../lib/timeline'
-import { summarizeTool } from '../lib/toolCards'
+import { canonicalizeToolName, summarizeTool, toolPath } from '../lib/toolCards'
 import { langFromPath } from '../lib/toolCards'
-import { highlightCode } from '../lib/highlight'
+import { NumberedCode } from '../lib/highlight'
 import { CopyButton } from './CopyButton'
 
 type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
@@ -25,15 +25,15 @@ function duration(items: ToolItem[]): string {
 }
 
 export function groupToolActivity(items: ToolItem[]): ToolGroup[] {
-  const shell = items.filter((item) => item.name.toLowerCase() === 'bash')
-  const reads = items.filter((item) => item.name.toLowerCase() === 'read')
-  const searches = items.filter((item) => ['grep', 'find', 'ls'].includes(item.name.toLowerCase()))
+  const shell = items.filter((item) => canonicalizeToolName(item.name) === 'bash')
+  const reads = items.filter((item) => canonicalizeToolName(item.name) === 'read')
+  const searches = items.filter((item) => ['grep', 'find', 'ls'].includes(canonicalizeToolName(item.name)))
   const categorized = new Set([...shell, ...reads, ...searches].map((item) => item.id))
   const other = items.filter((item) => !categorized.has(item.id))
   const groups: ToolGroup[] = []
 
   if (reads.length) {
-    const firstPath = String(reads[0]?.args.path ?? reads[0]?.args.file_path ?? '')
+    const firstPath = toolPath(reads[0]?.args ?? {})
     groups.push({
       key: 'read',
       title: reads.length === 1 ? `Read ${firstPath || 'file'}` : `${reads.length} files read`,
@@ -97,8 +97,8 @@ export function ToolActivitySummary({
 
 function commandText(item: ToolItem): string {
   if (typeof item.args.command === 'string') return item.args.command
-  if (typeof item.args.path === 'string') return item.args.path
-  if (typeof item.args.file_path === 'string') return item.args.file_path
+  const path = toolPath(item.args)
+  if (path) return path
   return summarizeTool(item.name, item.args)
 }
 
@@ -154,7 +154,7 @@ export function ToolDetailsRail({ group, onClose }: { group: ToolGroup; onClose:
                     <CopyButton text={command} label="Copy command" className="tool-rail__copy" iconOnly />
                   </div>
                   {item.output && (
-                    <pre><code>{highlightCode(item.output, langFromPath(String(item.args.path ?? item.args.file_path ?? '')))}</code></pre>
+                    <NumberedCode code={item.output} language={langFromPath(toolPath(item.args))} />
                   )}
                 </div>
               </details>

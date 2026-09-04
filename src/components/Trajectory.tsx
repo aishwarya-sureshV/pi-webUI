@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { TimelineItem } from '../lib/timeline'
+import { displayToolName } from '../lib/toolCards'
 
 type TrajectoryRecord = {
   item: TimelineItem
@@ -65,7 +66,7 @@ function buildTrajectory(items: TimelineItem[]): TrajectoryTurn[] {
       timestamp,
       duration,
       summary: item.kind === 'tool'
-        ? `${item.name} ${compact(JSON.stringify(item.args), 110)}${item.output ? ` → ${compact(item.output, 110)}` : ''}`
+        ? `${displayToolName(item.name)} ${compact(JSON.stringify(item.args), 110)}${item.output ? ` → ${compact(item.output, 110)}` : ''}`
         : compact(text),
       searchable: `${kindLabel(item)} ${text}`.toLowerCase(),
     }
