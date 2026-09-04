@@ -12,17 +12,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
-
-const CO_PARTNER_PROMPT = [
-  'You are working inside a web workbench as a thinking co-partner.',
-  'Keep every reasoning summary minimal: state only what is useful and necessary for the next',
-  'output — the decision, the immediate reason, and the expected evidence. Cut all redundancy:',
-  'do not restate the user’s request, drop filler and hedging, and never dump a full',
-  'chain-of-thought. A few focused lines are enough.',
-  'Before a tool call or material action, give a one-line decision-oriented rationale (what, why,',
-  'expected evidence). After tools run, briefly note how the evidence changed the conclusion.',
-  'Use plain language and stay terse throughout.',
-].join(' ')
+import { CO_PARTNER_PROMPT } from './co-partner-prompt.js'
 
 function formatClaudeModelName(value) {
   const stripped = String(value || '')

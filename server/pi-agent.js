@@ -13,17 +13,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { readCodexRateLimits } from './codex-usage.js'
-
-const CO_PARTNER_PROMPT = [
-  'You are working inside a web workbench as a thinking co-partner.',
-  'Keep every reasoning summary minimal: state only what is useful and necessary for the next',
-  'output — the decision, the immediate reason, and the expected evidence. Cut all redundancy:',
-  'do not restate the user’s request, drop filler and hedging, and never dump a full',
-  'chain-of-thought. A few focused lines are enough.',
-  'Before a tool call or material action, give a one-line decision-oriented rationale (what, why,',
-  'expected evidence). After tools run, briefly note how the evidence changed the conclusion.',
-  'Use plain language and stay terse throughout.',
-].join(' ')
+import { CO_PARTNER_PROMPT } from './co-partner-prompt.js'
+import { listOllamaModels, mergeModelLists, syncOllamaModelsJson } from './ollama-models.js'
 
 const PLAN_MODE_PROMPT = [
   'You are in plan mode, a strictly read-only exploration phase.',
@@ -37,6 +28,13 @@ const PLAN_MODE_PROMPT = [
 ].join('\n')
 
 const USAGE_CACHE_TTL_MS = 5 * 60_000
+
+// Control commands (state, model, session ops) must answer promptly; a hung
+// pi child would otherwise leave the pending entry and the HTTP request
+// hanging forever. Long-lived turn commands are deliberately untimed — a
+// prompt legitimately runs for minutes and the turn streams over SSE.
+const DEFAULT_RPC_TIMEOUT_MS = 60_000
+const UNTIMED_COMMANDS = new Set(['prompt', 'steer', 'follow_up'])
 
 function resolvePiExecutable() {
   return process.env.PI_WEB_PI_BIN || 'pi'
@@ -103,6 +101,7 @@ class PiAgentProcess {
       catch (error) { return { ok: false, error: String(error?.message ?? error) } }
     }
     this.setStatus('starting')
+    this.cwd = cwd
     this.stdoutBuffer = ''
     const systemPrompt = options.agentMode === 'plan'
       ? `${CO_PARTNER_PROMPT}\n\n${PLAN_MODE_PROMPT}`
@@ -127,14 +126,14 @@ class PiAgentProcess {
     })
     child.once('error', (error) => {
       this.failPending(error)
-      this.process = undefined
+      if (this.process === child) this.process = undefined
       this.setStatus('error', error.message)
     })
     child.once('exit', (code, signal) => {
       this.flushStdout()
       this.failPending(new Error(`Pi exited (${signal ?? code ?? 'unknown'})`))
-      this.process = undefined
-      if (this.status !== 'stopped') {
+      if (this.process === child) this.process = undefined
+      if (this.status !== 'stopped' && this.process === undefined) {
         const err = code && code !== 0 ? `Pi exited with code ${code}` : undefined
         this.setStatus(err ? 'error' : 'stopped', err)
       }
@@ -180,7 +179,22 @@ class PiAgentProcess {
     return this.runCommand({ type: 'compact', ...(customInstructions ? { customInstructions } : {}) })
   }
   async setModel(provider, modelId) {
+    if (provider === 'ollama') {
+      try {
+        await syncOllamaModelsJson(await listOllamaModels())
+      } catch { /* listing is best-effort; set_model may still work */ }
+    }
     const result = await this.runCommand({ type: 'set_model', provider, modelId })
+    if (!result.ok && provider === 'ollama' && this.cwd) {
+      const sessionPath = this.lastState?.sessionFile
+      const thinkingLevel = this.lastState?.thinkingLevel
+      this.stop()
+      return this.start(this.cwd, {
+        model: { provider, id: modelId },
+        ...(sessionPath ? { sessionPath } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      })
+    }
     if (!result.ok) return result
     this.usageCache = { at: 0, result: undefined }
     try {
@@ -255,10 +269,18 @@ class PiAgentProcess {
   }
 
   async getAvailableModels() {
-    const response = await this.send({ type: 'get_available_models' })
-    if (response.success === false) return { ok: false, error: response.error ?? 'failed' }
+    const [response, ollama] = await Promise.all([
+      this.send({ type: 'get_available_models' }),
+      listOllamaModels().catch(() => []),
+    ])
+    if (ollama.length) void syncOllamaModelsJson(ollama).catch(() => {})
+    if (response.success === false) {
+      if (ollama.length) return { ok: true, models: ollama }
+      return { ok: false, error: response.error ?? 'failed' }
+    }
     const data = response.data
-    return { ok: true, models: Array.isArray(data) ? data : (data?.models ?? []) }
+    const models = Array.isArray(data) ? data : (data?.models ?? [])
+    return { ok: true, models: mergeModelLists(models, ollama) }
   }
 
   async getThinkingLevels() {
@@ -404,11 +426,14 @@ class PiAgentProcess {
     const id = `req-${this.nextRequestId++}`
     const payload = { ...command, id }
     return new Promise((resolve, reject) => {
-      const timeout = timeoutMs
+      const effectiveTimeout =
+        timeoutMs ??
+        (UNTIMED_COMMANDS.has(command.type) ? undefined : DEFAULT_RPC_TIMEOUT_MS)
+      const timeout = effectiveTimeout
         ? setTimeout(() => {
             this.pending.delete(id)
             reject(new Error(`${command.type} timed out`))
-          }, timeoutMs)
+          }, effectiveTimeout)
         : undefined
       this.pending.set(id, {
         resolve: (value) => {
