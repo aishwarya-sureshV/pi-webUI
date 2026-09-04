@@ -24,6 +24,9 @@
  *   POST /api/:sessionKey/compact          { customInstructions? }
  *   POST /api/:sessionKey/set-model        { provider, modelId }
  *   POST /api/:sessionKey/set-thinking     { level }
+ *   GET  /api/:sessionKey/git-changes?cwd=  -> branch, remote, per-file working-tree changes
+ *   GET  /api/:sessionKey/git-changes?cwd=&file= -> one file's diff vs HEAD
+ *   POST /api/:sessionKey/git              { cwd, op: push|pull|commit-push }
  *   GET  /api/:sessionKey/commands
  *   GET  /api/:sessionKey/models
  *   GET  /api/:sessionKey/thinking-levels
@@ -33,7 +36,6 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   open as openFile,
-  readFile,
   readdir,
   rename,
   rm,
@@ -41,7 +43,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   basename,
   dirname,
@@ -49,7 +51,6 @@ import {
   isAbsolute,
   join,
   normalize,
-  relative,
   resolve,
   sep,
 } from "node:path";
@@ -59,7 +60,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import pty from "node-pty";
-import { PiAgentPool } from "./pi-agent.js";
+import { PiAgentPool, generateSessionTitle } from "./pi-agent.js";
 import { ClaudeAgentPool } from "./claude-agent.js";
 import { GrokAgentPool } from "./grok-agent.js";
 import {
@@ -92,7 +93,8 @@ const execFileAsync = promisify(execFile);
 const workspaceRoots = new Set(defaultWorkspaceRoots());
 
 function addWorkspaceRoot(path) {
-  if (typeof path === "string" && path.trim()) workspaceRoots.add(resolve(path));
+  if (typeof path === "string" && path.trim())
+    workspaceRoots.add(resolve(path));
 }
 
 function confineWorkspacePath(requested) {
@@ -392,6 +394,94 @@ function poolFor(backend) {
 }
 
 /**
+ * Claude-style session titles for Pi sessions: after the first prompt, a
+ * short-lived ephemeral pi process summarizes it into a concise title, which
+ * is persisted via set_session_name (a session_info entry the sidebar already
+ * reads). Best-effort and fire-and-forget — failures leave the prompt-derived
+ * fallback in place.
+ */
+const piTitleInFlight = new Set();
+
+/**
+ * Resolves when the agent's current turn ends. The listener is attached by the
+ * caller *before* any await, so a turn that settles while the title is being
+ * generated is never missed. `agent.status` is not a reliable idle check right
+ * after a prompt is dispatched (the RPC acks before agent_start arrives), so
+ * an early exit is only taken on a state read that says the agent is idle.
+ */
+function whenTurnSettles(agent, isSettled, waiters) {
+  if (isSettled()) return Promise.resolve();
+  return new Promise((resolve) => {
+    // unref'd: a pending title write must never hold the server open.
+    const timer = setTimeout(resolve, 20 * 60_000);
+    timer.unref?.();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    waiters.add(done);
+    void agent
+      .getState()
+      .then((state) => {
+        if (!state?.isStreaming) {
+          waiters.delete(done);
+          done();
+        }
+      })
+      .catch(() => {});
+  });
+}
+
+/**
+ * Two separate steps, because they have opposite timing needs:
+ *
+ *  - Generating the title is a bare, ephemeral pi process that never touches
+ *    the live agent, so it runs immediately and the UI is relabelled the
+ *    moment it lands (a couple of seconds), while the turn keeps streaming.
+ *  - Persisting it is a set_session_name RPC *on the live process*. Issuing
+ *    that mid-stream raced the running turn (it could stop sibling sessions
+ *    or leave the new one stuck "thinking"), so the write waits for the turn
+ *    to settle.
+ */
+function maybeGeneratePiTitle(sessionKey, agent, message) {
+  if (piTitleInFlight.has(sessionKey)) return;
+  piTitleInFlight.add(sessionKey);
+  let settled = false;
+  const waiters = new Set();
+  // Attached synchronously: a turn that ends during generation still counts.
+  const off = agent.onEvent((event) => {
+    if (event.type !== "agent_settled") return;
+    settled = true;
+    for (const resolve of waiters) resolve();
+    waiters.clear();
+  });
+  void (async () => {
+    try {
+      // Always read fresh state: lastState is not updated by set_session_name,
+      // so a second prompt would otherwise regenerate (and overwrite) the title.
+      const state = await agent.getState();
+      if (state?.sessionName) return;
+      const title = await generateSessionTitle(message, state?.model);
+      if (!title) return;
+      // Publish first: the label updates in the background, independently of
+      // when (or whether) the write to the session file succeeds.
+      publishRuntimeEvent(sessionKey, "pi", {
+        type: "session_title_set",
+        title,
+      });
+      await whenTurnSettles(agent, () => settled, waiters);
+      await agent.setSessionName(title);
+    } catch {
+      /* title generation is best-effort */
+    } finally {
+      off();
+      waiters.clear();
+      piTitleInFlight.delete(sessionKey);
+    }
+  })();
+}
+
+/**
  * A page refresh re-opens saved sessions under fresh tab keys. If a process
  * is already live for the same session file, rebind it to the new key
  * instead of spawning a duplicate — otherwise the original run keeps
@@ -420,6 +510,21 @@ function adoptLiveAgent(sessionKey, backend, sessionPath) {
       SESSION_LEASES.delete(key);
       SESSION_LEASES.set(sessionKey, lease);
     }
+    // The runtime event log belongs to the conversation too — carry it over
+    // so /api/<newKey>/log includes the in-flight turn's pre-reload events
+    // (needed to replay the live run after a page refresh). Entry counts
+    // move, they are not duplicated, so the global budget is unchanged.
+    const previousLog = runtimeLogs.get(key);
+    if (previousLog && previousLog.length > 0) {
+      runtimeLogs.delete(key);
+      const currentLog = runtimeLogs.get(sessionKey) ?? [];
+      runtimeLogs.set(
+        sessionKey,
+        [...previousLog, ...currentLog].sort(
+          (left, right) => left.timestamp - right.timestamp,
+        ),
+      );
+    }
     // A parked goal belongs to the conversation, not the browser tab.
     const goal = CONVERSATION_GOALS.get(key);
     if (goal) {
@@ -439,9 +544,18 @@ function watch(sessionKey, requestedBackend) {
       : backendName(requestedBackend);
   sessionBackends.set(sessionKey, backend);
   const agent = poolFor(backend).get(sessionKey);
-  if (!agent.__watched) {
-    agent.__watched = true;
-    agent.onEvent((event) => publishRuntimeEvent(sessionKey, backend, event));
+  // Rebind rather than register once: adoptLiveAgent moves a running process
+  // to the refreshed page's key, and a listener still closed over the old key
+  // published the whole in-flight turn under a key no client is listening on
+  // — the reloaded page sat frozen on its restored snapshot until the turn
+  // ended. Re-registering keeps exactly one publisher, on the current key.
+  if (agent.__watchedKey !== sessionKey || agent.__watchedBackend !== backend) {
+    agent.__unwatch?.();
+    agent.__watchedKey = sessionKey;
+    agent.__watchedBackend = backend;
+    agent.__unwatch = agent.onEvent((event) =>
+      publishRuntimeEvent(sessionKey, backend, event),
+    );
   }
   return agent;
 }
@@ -454,7 +568,12 @@ function isAllowedOrigin(origin) {
     const host = url.hostname;
     // Exact hosts only. Public signup namespaces like *.pages.dev / *.workers.dev
     // are attacker-ownable and must never be trusted by suffix match.
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]")
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host === "[::1]"
+    )
       return true;
     return origin === process.env.PI_WEB_UI_ORIGIN;
   } catch {
@@ -519,7 +638,11 @@ function serveStatic(res, pathname) {
   const abs = join(DIST, filePath);
   // Trailing-separator check: a sibling "dist-anything" directory must not be
   // served as if it were the build output.
-  if (!abs.startsWith(DIST + sep) || !existsSync(abs) || !statSync(abs).isFile()) {
+  if (
+    !abs.startsWith(DIST + sep) ||
+    !existsSync(abs) ||
+    !statSync(abs).isFile()
+  ) {
     // SPA fallback
     const index = join(DIST, "index.html");
     if (existsSync(index)) {
@@ -825,7 +948,9 @@ async function openWorkspacePath(requested, app) {
     // Only apps the server itself advertises may be launched; a client-supplied
     // app name would otherwise let any caller launch arbitrary applications.
     const knownApp =
-      app && MAC_APPS.some((candidate) => candidate.id === app) ? app : undefined;
+      app && MAC_APPS.some((candidate) => candidate.id === app)
+        ? app
+        : undefined;
     if (knownApp) await execFileAsync("open", ["-a", knownApp, path]);
     else await execFileAsync("open", [path]);
   } else if (process.platform === "linux") {
@@ -1175,6 +1300,12 @@ async function route(req, res) {
     // duplicate — its live state, including isStreaming, carries over.
     adoptLiveAgent(sessionKey, body.backend, body.sessionPath);
     const agent = watch(sessionKey, body.backend);
+    // adoptOnly: attach to a live process but never spawn one. Grok stays
+    // lazy for mere viewing (starting it wrote ghost session files); this
+    // lets a refreshed tab re-adopt a mid-run grok turn without that cost.
+    if (body.adoptOnly && !agent.process) {
+      return sendJson(res, 200, { ok: false, error: "no live agent to adopt" });
+    }
     const result = await runLoggedCommand(sessionKey, "start", body, () =>
       agent.start(body.cwd || process.cwd(), {
         model:
@@ -1222,34 +1353,32 @@ async function route(req, res) {
         ? Boolean(promptAgent.connection)
         : Boolean(promptAgent.process);
     if (!agentAlive) {
-      const started = await runLoggedCommand(
-        sessionKey,
-        "start",
-        body,
-        () =>
-          promptAgent.start(String(body.cwd || process.cwd()), {
-            sessionPath:
-              typeof body.sessionPath === "string" && body.sessionPath
-                ? body.sessionPath
-                : undefined,
-            model:
-              body.model && typeof body.model === "object"
-                ? {
-                    provider: String(body.model.provider || ""),
-                    id: String(body.model.id || ""),
-                  }
-                : undefined,
-            thinkingLevel:
-              typeof body.thinkingLevel === "string"
-                ? body.thinkingLevel
-                : undefined,
-          }),
+      const started = await runLoggedCommand(sessionKey, "start", body, () =>
+        promptAgent.start(String(body.cwd || process.cwd()), {
+          sessionPath:
+            typeof body.sessionPath === "string" && body.sessionPath
+              ? body.sessionPath
+              : undefined,
+          model:
+            body.model && typeof body.model === "object"
+              ? {
+                  provider: String(body.model.provider || ""),
+                  id: String(body.model.id || ""),
+                }
+              : undefined,
+          thinkingLevel:
+            typeof body.thinkingLevel === "string"
+              ? body.thinkingLevel
+              : undefined,
+        }),
       );
       if (!started.ok) return sendJson(res, 500, started);
     }
     const result = await runLoggedCommand(sessionKey, "prompt", body, () =>
       watch(sessionKey).prompt(message, images),
     );
+    if (promptBackend === "pi")
+      maybeGeneratePiTitle(sessionKey, promptAgent, message);
     return sendJson(res, result.ok ? 200 : 500, result);
   }
   if (req.method === "POST" && action === "steer") {
@@ -1383,11 +1512,28 @@ async function route(req, res) {
   }
   if (req.method === "POST" && action === "resume") {
     const body = await readBody(req);
+    const sessionPath = String(body.sessionPath ?? "");
+    const resumeAgent = watch(sessionKey);
+    // switch_session aborts a running turn on purpose: a *persisted* session
+    // can carry a stale isStreaming flag from another pi process. But when
+    // this agent is already live on the requested file (a page refresh
+    // adopted it mid-run), that abort kills the very turn the reload is
+    // supposed to preserve — the "request was aborted" a refresh produced.
+    // Hand back the live transcript instead of switching into it.
+    const liveFile =
+      resumeAgent.sessionFile ?? resumeAgent.lastState?.sessionFile;
+    if (sessionPath && liveFile === sessionPath) {
+      const liveState = await resumeAgent.getState().catch(() => undefined);
+      if (liveState?.isStreaming) {
+        const messages = await resumeAgent.getMessages().catch(() => []);
+        return sendJson(res, 200, { ok: true, state: liveState, messages });
+      }
+    }
     return sendJson(
       res,
       200,
       await runLoggedCommand(sessionKey, "resume", body, () =>
-        watch(sessionKey).switchSession(String(body.sessionPath ?? "")),
+        resumeAgent.switchSession(sessionPath),
       ),
     );
   }
@@ -1415,9 +1561,137 @@ async function route(req, res) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     return sendJson(res, 200, setSessionGoal(sessionKey, text));
   }
+  // Working-tree changes for the post-turn "Changes" card: branch, GitHub
+  // connectivity (an `origin` remote must exist — push errors surface on push),
+  // and per-file status plus line counts. `?file=` returns that file's diff.
+  // Read-only git, but the target dir still gets confined because the output
+  // discloses repo contents.
+  if (req.method === "GET" && action === "git-changes") {
+    const cwdParam = url.searchParams.get("cwd") || "";
+    let dir;
+    try {
+      dir = cwdParam ? confineWorkspacePath(cwdParam) : process.cwd();
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: String(error?.message ?? error),
+      });
+    }
+    const git = async (args) => {
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          "git",
+          ["-C", dir, ...args],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+        );
+        return { ok: true, stdout: String(stdout), stderr: String(stderr) };
+      } catch (error) {
+        return {
+          ok: false,
+          stdout: String(error?.stdout ?? ""),
+          stderr: String(error?.stderr || error?.message || error),
+        };
+      }
+    };
+    const inside = await git(["rev-parse", "--is-inside-work-tree"]);
+    if (!inside.ok || inside.stdout.trim() !== "true")
+      return sendJson(res, 200, {
+        ok: true,
+        repo: false,
+        connected: false,
+        changes: [],
+      });
+    if (url.searchParams.has("file")) {
+      const file = String(url.searchParams.get("file"));
+      if (
+        isAbsolute(file) ||
+        file.split(/[\\/]/).includes("..") ||
+        file.startsWith(":")
+      )
+        return sendJson(res, 400, { ok: false, error: "Invalid file path." });
+      // Untracked files never appear in `git diff HEAD`; probe first.
+      const probed = await git([
+        "status",
+        "--porcelain=v1",
+        "--no-renames",
+        "--",
+        file,
+      ]);
+      const line = probed.stdout.split("\n").find((row) => row.length > 3);
+      const diff = line?.startsWith("??")
+        ? await git(["diff", "--no-index", "--", "/dev/null", file])
+        : await git(["diff", "HEAD", "--", file]);
+      const text = `${diff.stdout}${diff.stderr}`.trim();
+      return sendJson(res, 200, {
+        ok: true,
+        diff: text.slice(0, 200_000),
+      });
+    }
+    const [remoteProbe, branchProbe, statusProbe, numstatProbe] =
+      await Promise.all([
+        git(["remote", "get-url", "origin"]),
+        git(["branch", "--show-current"]),
+        git(["status", "--porcelain=v1", "--no-renames"]),
+        git(["diff", "--numstat", "HEAD"]),
+      ]);
+    const remote = remoteProbe.ok ? remoteProbe.stdout.trim() : "";
+    const branch = branchProbe.stdout.trim() || "(detached)";
+    const counts = new Map();
+    for (const row of numstatProbe.stdout.split("\n")) {
+      const match = row.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+      if (match)
+        counts.set(match[3].replace(/^"|"$/g, ""), {
+          additions: Number(match[1]) || 0,
+          deletions: Number(match[2]) || 0,
+        });
+    }
+    const changes = [];
+    for (const row of statusProbe.stdout.split("\n")) {
+      if (row.length < 4) continue;
+      const code = row.slice(0, 2);
+      const path = row.slice(3).replace(/^"|"$/g, "");
+      const untracked = code.startsWith("??");
+      const letter = untracked ? "A" : code[1] === "." ? code[0] : code[1];
+      if (untracked) {
+        const probe = await git([
+          "diff",
+          "--no-index",
+          "--numstat",
+          "--",
+          "/dev/null",
+          path,
+        ]);
+        const match = probe.stdout.match(/^(\d+|-)\t(\d+|-)\t/);
+        counts.set(path, {
+          additions: match ? Number(match[1]) || 0 : 0,
+          deletions: match ? Number(match[2]) || 0 : 0,
+        });
+      }
+      const stat = counts.get(path) ?? { additions: 0, deletions: 0 };
+      changes.push({
+        path,
+        status:
+          letter === "A" ? "added" : letter === "D" ? "deleted" : "modified",
+        additions: stat.additions,
+        deletions: stat.deletions,
+      });
+      // One row per file: a path can appear staged AND worktree-modified;
+      // skip duplicates (deeper status merge would double-count).
+      counts.delete(path);
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      repo: true,
+      connected: Boolean(remote),
+      remote,
+      branch,
+      changes,
+    });
+  }
   if (req.method === "POST" && action === "git") {
     const body = await readBody(req);
-    const op = body.op === "pull" ? "pull" : "push";
+    const op =
+      body.op === "pull" || body.op === "commit-push" ? body.op : "push";
     const dir =
       typeof body.cwd === "string" && body.cwd ? body.cwd : process.cwd();
     // git pull/push run repo hooks (post-merge, pre-push) as this user, so the
@@ -1436,6 +1710,47 @@ async function route(req, res) {
       body,
       async () => {
         try {
+          if (op === "commit-push") {
+            const message =
+              typeof body.message === "string" ? body.message.trim() : "";
+            if (!message)
+              return { ok: false, error: "Commit message required." };
+            const run = (args) =>
+              execFileAsync("git", ["-C", dir, ...args], {
+                timeout: 120_000,
+                maxBuffer: 4 * 1024 * 1024,
+              });
+            const out = [];
+            await run(["add", "-A"]);
+            try {
+              const commit = await run(["commit", "-m", message]);
+              out.push(`${commit.stdout}${commit.stderr}`.trim());
+            } catch (error) {
+              const text = String(error?.stderr || error?.message || error);
+              if (!/nothing to commit|no changes added/i.test(text))
+                return { ok: false, error: text };
+              out.push("Nothing new to commit.");
+            }
+            try {
+              const push = await run(["push"]);
+              out.push(`${push.stdout}${push.stderr}`.trim());
+            } catch (error) {
+              const text = String(error?.stderr || error?.message || error);
+              if (!/no upstream|has no upstream/i.test(text))
+                return { ok: false, error: text };
+              // First push of a fresh branch: bind it to origin.
+              try {
+                const retry = await run(["push", "-u", "origin", "HEAD"]);
+                out.push(`${retry.stdout}${retry.stderr}`.trim());
+              } catch (error2) {
+                return {
+                  ok: false,
+                  error: String(error2?.stderr || error2?.message || error2),
+                };
+              }
+            }
+            return { ok: true, output: out.filter(Boolean).join("\n") };
+          }
           const { stdout, stderr } = await execFileAsync(
             "git",
             ["-C", dir, op],

@@ -481,6 +481,23 @@
  box-shadow: 0 0 0 0 color-mix(in srgb, var(--ds-activity) 65%, transparent);
  animation: pw-run-glow 1.6s ease-out infinite;
 }
+.sidebar__await-dot {
+ width: 7px;
+ height: 7px;
+ border-radius: 50%;
+ flex: none;
+ /* Hollow amber, deliberately unlike the solid pulsing green run dot: the
+    session is stopped and waiting on you, not working. */
+ background: transparent;
+ border: 2px solid var(--ds-status-warning);
+}
+.sidebar__item.is-awaiting .sidebar__item-label {
+ color: var(--ds-status-warning);
+}
+.sidebar__item.is-awaiting::before,
+.sidebar__item.is-active-session.is-awaiting::before {
+ content: none !important;
+}
 .sidebar__nav-item .sidebar__run-dot {
  margin-left: auto;
 }
@@ -764,7 +781,9 @@
 .center {
  position: relative;
  display: flex;
- flex-direction: column;
+ /* Row: the session/workbench body shares the row with the docked terminal
+    pane; each child manages its own internal column layout. */
+ flex-direction: row;
  min-width: 0;
  min-height: 0;
  height: 100%;
@@ -776,6 +795,51 @@
  --pw-chat-content-width: 900px;
  --pw-composer-card-max-width: 900px;
  --pw-composer-side-clearance: 16px;
+}
+.center__body {
+ display: flex;
+ flex-direction: column;
+ flex: 1 1 auto;
+ min-width: 0;
+ min-height: 0;
+}
+/* Terminal pane expanded: hide the session body without unmounting it. */
+.center__body.is-hidden {
+ display: none;
+}
+
+.terminal-pane {
+ display: flex;
+ flex-direction: column;
+ flex: none;
+ min-width: 280px;
+ min-height: 0;
+ border-left: 1px solid var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-bg-base);
+ overflow: hidden;
+}
+.terminal-pane.is-expanded {
+ flex: 1 1 auto;
+}
+.terminal-pane-resizer {
+ position: relative;
+ z-index: 20;
+ flex: none;
+ width: 8px;
+ padding: 0;
+ border: 0;
+ background: transparent;
+ cursor: col-resize;
+ touch-action: none;
+}
+.terminal-pane-resizer:hover,
+.terminal-pane-resizer:focus-visible,
+.is-resizing-sessions .terminal-pane-resizer {
+ background: var(--dsw-alias-state-business-primary);
+ opacity: 0.45;
+}
+.terminal-pane-resizer:focus-visible {
+ outline: 0;
 }
 
 .session-grid {
@@ -1122,20 +1186,29 @@
  padding: 10px 18px;
  border-bottom: 1px solid var(--dsw-alias-border-l2);
 }
-.terminal-page__header > div {
+.terminal-page__heading {
  display: flex;
- flex-direction: column;
+ align-items: center;
+ gap: 8px;
+ flex: 1;
  min-width: 0;
 }
-.terminal-page__header strong {
+.terminal-page__heading strong {
  font-size: 13px;
 }
-.terminal-page__header span {
+.terminal-page__cwd {
  overflow: hidden;
  color: var(--dsw-alias-label-caption);
  font-size: 10px;
  text-overflow: ellipsis;
  white-space: nowrap;
+}
+.terminal-page__actions {
+ display: flex;
+ align-items: center;
+ flex: none;
+ gap: 8px;
+ margin-left: auto;
 }
 .terminal-page__new {
  display: grid;
@@ -1143,13 +1216,34 @@
  flex: none;
  width: 28px;
  height: 28px;
- margin-left: auto;
  border: 1px solid var(--dsw-alias-border-l2);
  border-radius: 7px;
  background: transparent;
  color: var(--dsw-alias-label-secondary);
  font-size: 18px;
  line-height: 1;
+}
+.terminal-pane .terminal-page__new {
+ height: 26px;
+ width: 26px;
+ font-size: 16px;
+}
+.terminal-page__pane-btn {
+ display: grid;
+ place-items: center;
+ flex: none;
+ width: 26px;
+ height: 26px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ border-radius: 7px;
+ background: transparent;
+ color: var(--dsw-alias-label-secondary);
+ font-size: 14px;
+ line-height: 1;
+}
+.terminal-page__pane-btn:hover {
+ background: var(--dsw-alias-interactive-bg-hover);
+ color: var(--dsw-alias-label-primary);
 }
 .terminal-page__new:hover,
 .terminal-page__tab-add:hover {
@@ -1160,10 +1254,13 @@
  display: flex;
  align-items: stretch;
  flex: none;
- min-height: 36px;
+ min-height: 34px;
  overflow-x: auto;
  border-bottom: 1px solid var(--dsw-alias-border-l2);
  background: var(--dsw-alias-bg-layer-1);
+}
+.terminal-pane .terminal-page__tabs {
+ min-height: 32px;
 }
 .terminal-page__tab {
  display: flex;
@@ -1441,40 +1538,49 @@
 
 /* Token gate: full-screen lock shown when the server requires PI_WEB_TOKEN. */
 .auth-gate {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  background: var(--ds-bg, #0f1115);
-  color: var(--ds-fg, #e6e6e6);
+ min-height: 100vh;
+ display: grid;
+ place-items: center;
+ background: var(--ds-bg, #0f1115);
+ color: var(--ds-fg, #e6e6e6);
 }
 .auth-gate__card {
-  width: min(360px, 90vw);
-  padding: 24px;
-  border-radius: 12px;
-  border: 1px solid var(--ds-border, #2a2d35);
-  background: var(--ds-panel, #17191f);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+ width: min(360px, 90vw);
+ padding: 24px;
+ border-radius: 12px;
+ border: 1px solid var(--ds-border, #2a2d35);
+ background: var(--ds-panel, #17191f);
+ display: flex;
+ flex-direction: column;
+ gap: 12px;
 }
-.auth-gate__card h1 { margin: 0; font-size: 18px; }
-.auth-gate__card p { margin: 0; font-size: 13px; opacity: 0.75; }
+.auth-gate__card h1 {
+ margin: 0;
+ font-size: 18px;
+}
+.auth-gate__card p {
+ margin: 0;
+ font-size: 13px;
+ opacity: 0.75;
+}
 .auth-gate__card input {
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--ds-border, #2a2d35);
-  background: var(--ds-input, #0f1115);
-  color: inherit;
-  font: inherit;
+ padding: 8px 10px;
+ border-radius: 8px;
+ border: 1px solid var(--ds-border, #2a2d35);
+ background: var(--ds-input, #0f1115);
+ color: inherit;
+ font: inherit;
 }
 .auth-gate__card button {
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: none;
-  background: var(--ds-accent, #4f8cff);
-  color: #fff;
-  font: inherit;
-  font-weight: 600;
-  cursor: pointer;
+ padding: 8px 12px;
+ border-radius: 8px;
+ border: none;
+ background: var(--ds-accent, #4f8cff);
+ color: #fff;
+ font: inherit;
+ font-weight: 600;
+ cursor: pointer;
 }
-.auth-gate__error { color: #ff6b6b; }
+.auth-gate__error {
+ color: #ff6b6b;
+}

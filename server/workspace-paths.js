@@ -8,12 +8,21 @@
  * origin) could read, write, or delete arbitrary files on the machine.
  */
 import { realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 
 /** True when `candidate` is `root` itself or lives under it. */
 export function isWithinRoot(candidate, root) {
   const fromRoot = relative(root, candidate);
-  return fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot));
+  return (
+    fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot))
+  );
 }
 
 /**
@@ -76,7 +85,9 @@ export function confinePath(requested, roots) {
  */
 export function defaultWorkspaceRoots() {
   const roots = [process.cwd()];
-  for (const entry of String(process.env.PI_WEB_WORKSPACE_ROOTS || "").split(":")) {
+  for (const entry of String(process.env.PI_WEB_WORKSPACE_ROOTS || "").split(
+    ":",
+  )) {
     const trimmed = entry.trim();
     if (trimmed) roots.push(resolve(trimmed));
   }

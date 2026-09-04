@@ -54,6 +54,7 @@ import {
 } from "./WorkspaceExplorer";
 import { CopyButton } from "./CopyButton";
 import { TodoTracker, TodoTranscript, extractTodos } from "./TodoTracker";
+import { ChangesPanel } from "./ChangesPanel";
 import { UsageSummary } from "./UsageDisplay";
 import {
   ActiveRunIndicator,
@@ -1092,6 +1093,11 @@ export function Conversation({
     setDraft("");
     setAttachments([]);
     stickToBottom.current = true;
+    // Optimistic pending-run state: the RPC prompt response only arrives when
+    // the whole turn completes, and agent_start can lag (a stalled model call
+    // once left the UI silent for 225s). Show "working" immediately so the
+    // user always knows the request was sent — and has a stop affordance.
+    timeline.markPendingRun();
 
     // A model's natural-language self-identification is not authoritative:
     // aliases and provider prompts can make Luna claim to be Kimi. For this
@@ -1101,6 +1107,7 @@ export function Conversation({
       state?.model &&
       isModelIdentityQuestion(message)
     ) {
+      timeline.clearPendingRun();
       timeline.appendAssistant(runtimeModelAnswer(state.model));
       return;
     }
@@ -1118,6 +1125,7 @@ export function Conversation({
       : await api.prompt(tab.key, outboundMessage, promptOptions);
     if (!result.ok) {
       setAttachments(pickedAttachments);
+      timeline.clearPendingRun();
       timeline.appendNotice(result.error ?? "prompt failed", "error");
     }
   };
@@ -1788,6 +1796,10 @@ export function Conversation({
       <>
         {split && (
           <div className="conversation-header conversation-header--empty">
+            <div
+              className="conversation-header__hover-strip"
+              aria-hidden="true"
+            />
             <div className="conversation-header__top">
               <div
                 className="conversation-header__identity"
@@ -1860,6 +1872,7 @@ export function Conversation({
   return (
     <>
       <div className="conversation-header">
+        <div className="conversation-header__hover-strip" aria-hidden="true" />
         <div className="conversation-header__top">
           <div
             className="conversation-header__identity"
@@ -1889,25 +1902,6 @@ export function Conversation({
             <div className="conversation-header__status">Working</div>
           )}
           <div className="conversation-header__spacer" />
-          <button
-            type="button"
-            className={`conversation-header__download conversation-header__icon-btn${workspaceOpen ? " is-active" : ""}`}
-            aria-pressed={workspaceOpen}
-            aria-label="View project source"
-            title="View project source"
-            onClick={toggleWorkspace}
-          >
-            <IconCode size={14} />
-          </button>
-          <button
-            type="button"
-            className="conversation-header__download conversation-header__icon-btn"
-            aria-label="Session details"
-            title="Session details"
-            onClick={() => setSessionDetailsOpen(true)}
-          >
-            <IconInfo size={14} />
-          </button>
           {onClose && (
             <button
               type="button"
@@ -1953,6 +1947,27 @@ export function Conversation({
           >
             Backend log
           </button>
+          <div className="conversation-header__tabs-actions">
+            <button
+              type="button"
+              className={`conversation-header__download conversation-header__icon-btn${workspaceOpen ? " is-active" : ""}`}
+              aria-pressed={workspaceOpen}
+              aria-label="View project source"
+              title="View project source"
+              onClick={toggleWorkspace}
+            >
+              <IconCode size={14} />
+            </button>
+            <button
+              type="button"
+              className="conversation-header__download conversation-header__icon-btn"
+              aria-label="Session details"
+              title="Session details"
+              onClick={() => setSessionDetailsOpen(true)}
+            >
+              <IconInfo size={14} />
+            </button>
+          </div>
         </div>
         {streaming && <div className="activity-line" aria-hidden="true" />}
       </div>
@@ -1994,6 +2009,13 @@ export function Conversation({
                   ),
                 )}
                 {!streaming && <TodoTranscript tasks={todos} />}
+                {!streaming && hasItems && tab.cwd && (
+                  <ChangesPanel
+                    sessionKey={tab.key}
+                    cwd={tab.cwd}
+                    streaming={streaming}
+                  />
+                )}
                 {streaming && runningShell ? (
                   <ActiveRunIndicator
                     item={runningShell}

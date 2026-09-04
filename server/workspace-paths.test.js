@@ -67,7 +67,10 @@ describe("confinePath", () => {
       await writeFile(join(dir, "secret.txt"), "s");
       await symlink(join(dir, "secret.txt"), join(dir, "project", "link.txt"));
       const roots = [join(dir, "project")];
-      assert.throws(() => confinePath(join(dir, "project", "link.txt"), roots), /outside/);
+      assert.throws(
+        () => confinePath(join(dir, "project", "link.txt"), roots),
+        /outside/,
+      );
     } finally {
       await cleanup();
     }
@@ -78,9 +81,15 @@ describe("confinePath", () => {
     try {
       await mkdir(join(dir, "project", "sub"), { recursive: true });
       await writeFile(join(dir, "project", "real.txt"), "s");
-      await symlink(join(dir, "project", "real.txt"), join(dir, "project", "sub", "link.txt"));
+      await symlink(
+        join(dir, "project", "real.txt"),
+        join(dir, "project", "sub", "link.txt"),
+      );
       const roots = [join(dir, "project")];
-      const inside = confinePath(join(dir, "project", "sub", "link.txt"), roots);
+      const inside = confinePath(
+        join(dir, "project", "sub", "link.txt"),
+        roots,
+      );
       assert.equal(inside, join(dir, "project", "sub", "link.txt"));
     } finally {
       await cleanup();

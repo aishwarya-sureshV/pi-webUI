@@ -8,7 +8,12 @@ import { describe, it } from "node:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { archiveSession, deleteSession, loadSessionLog, readSessionMessages } from "./sessions.js";
+import {
+  archiveSession,
+  deleteSession,
+  loadSessionLog,
+  readSessionMessages,
+} from "./sessions.js";
 
 describe("session path confinement", () => {
   it("rejects non-jsonl paths", async () => {

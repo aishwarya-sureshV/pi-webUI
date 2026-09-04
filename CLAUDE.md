@@ -12,6 +12,10 @@
 
 - API server: `4319` (`PI_WEB_PORT`), vite dev server: `5319` (proxies `/api` → 4319).
 - Health check: `curl -sf http://127.0.0.1:4319/api/health`.
+- **Test servers & scripts**: use a scratch port, `trap 'kill $PID' EXIT` cleanup,
+  and `--max-time` on every curl — never curl a streaming endpoint (`/api/events`)
+  without `--max-time`; it never closes. Never assume a port is free because the
+  last command exited — verify with `lsof` first.
 
 ## Debugging protocol — triage before you open anything
 

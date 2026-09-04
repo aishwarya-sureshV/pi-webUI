@@ -40,6 +40,7 @@ import {
   ClientSideConnection,
   ndJsonStream,
 } from "@zed-industries/agent-client-protocol";
+import { CLARIFY_PROMPT } from "./co-partner-prompt.js";
 
 const GROK_HOME = () => process.env.GROK_HOME || join(homedir(), ".grok");
 const GROK_HOME_AUTH = () => join(GROK_HOME(), "auth.json");
@@ -96,6 +97,28 @@ function acpTextOf(block) {
   return block?.type === "text" ? (block.text ?? "") : "";
 }
 
+// ACP has no system-prompt channel, so the always-on clarify instruction is
+// prepended to every outgoing prompt text instead. It stays in grok's own
+// chat history (keeping it in-context for the whole session) but is hidden
+// from pi-web's live timeline and stripped back out of replayed history so a
+// reload never shows it. The exact-string prefix makes the strip unambiguous.
+const CLARIFY_PROMPT_PREFIX = [
+  "[pi-web harness instruction — this block is not part of the user's message; do not quote, repeat, or reference it]",
+  CLARIFY_PROMPT,
+  "[end pi-web harness instruction]",
+  "",
+].join("\n");
+
+function withClarifyPrefix(text) {
+  return `${CLARIFY_PROMPT_PREFIX}${text}`;
+}
+
+function stripClarifyPrefix(text) {
+  return typeof text === "string" && text.startsWith(CLARIFY_PROMPT_PREFIX)
+    ? text.slice(CLARIFY_PROMPT_PREFIX.length)
+    : text;
+}
+
 // grok's ACP tool_call notifications don't populate the optional `kind`
 // field (confirmed empirically), so shell-command detection falls back to
 // known tool names -- this is what lets the UI show a live "running $ ..."
@@ -114,7 +137,12 @@ function toolResultText(content) {
 // scanning this directly; this adapter only needs to go the other direction
 // (recover a sessionId from a chat_history.jsonl path) to resume one.
 function sessionFilePathFor(cwd, sessionId) {
-  return join(GROK_SESSIONS_ROOT(), encodeURIComponent(cwd), sessionId, "chat_history.jsonl");
+  return join(
+    GROK_SESSIONS_ROOT(),
+    encodeURIComponent(cwd),
+    sessionId,
+    "chat_history.jsonl",
+  );
 }
 
 function sessionIdFromPath(sessionPath) {
@@ -211,7 +239,9 @@ class GrokAgentProcess {
       child.once("exit", (code, signal) => {
         this.process = undefined;
         if (this.turn) {
-          this.turn.reject?.(new Error(`Grok exited (${signal ?? code ?? "unknown"})`));
+          this.turn.reject?.(
+            new Error(`Grok exited (${signal ?? code ?? "unknown"})`),
+          );
           this.turn = undefined;
         }
         if (this.status !== "stopped") {
@@ -247,10 +277,14 @@ class GrokAgentProcess {
               : { outcome: { outcome: "cancelled" } };
           },
           async writeTextFile() {
-            throw new Error("writeTextFile not supported by pi-web's grok client");
+            throw new Error(
+              "writeTextFile not supported by pi-web's grok client",
+            );
           },
           async readTextFile() {
-            throw new Error("readTextFile not supported by pi-web's grok client");
+            throw new Error(
+              "readTextFile not supported by pi-web's grok client",
+            );
           },
         }),
         stream,
@@ -342,7 +376,11 @@ class GrokAgentProcess {
       this.closeOpenBlock(this.turn);
       const assistantMessage = this.turn.message;
       assistantMessage.stopReason = "end_turn";
-      this.emit({ type: "turn_end", sessionKey: this.sessionKey, message: assistantMessage });
+      this.emit({
+        type: "turn_end",
+        sessionKey: this.sessionKey,
+        message: assistantMessage,
+      });
       this.emit({
         type: "agent_end",
         sessionKey: this.sessionKey,
@@ -358,11 +396,19 @@ class GrokAgentProcess {
       this.emit({ type: "turn_start", sessionKey: this.sessionKey });
       const userMessage = {
         role: "user",
-        content: [{ type: "text", text: userText }],
+        content: [{ type: "text", text: stripClarifyPrefix(userText) }],
         timestamp: Date.now(),
       };
-      this.emit({ type: "message_start", sessionKey: this.sessionKey, message: userMessage });
-      this.emit({ type: "message_end", sessionKey: this.sessionKey, message: userMessage });
+      this.emit({
+        type: "message_start",
+        sessionKey: this.sessionKey,
+        message: userMessage,
+      });
+      this.emit({
+        type: "message_end",
+        sessionKey: this.sessionKey,
+        message: userMessage,
+      });
       const assistantMessage = {
         role: "assistant",
         content: [],
@@ -373,7 +419,11 @@ class GrokAgentProcess {
         stopReason: "pending",
         timestamp: Date.now(),
       };
-      this.emit({ type: "message_start", sessionKey: this.sessionKey, message: assistantMessage });
+      this.emit({
+        type: "message_start",
+        sessionKey: this.sessionKey,
+        message: assistantMessage,
+      });
       this.turn = {
         content: assistantMessage.content,
         openKind: undefined,
@@ -420,7 +470,11 @@ class GrokAgentProcess {
     }
     const turn = this.turn;
     if (!turn) {
-      this.emit({ type: "grok_session_update", sessionKey: this.sessionKey, update });
+      this.emit({
+        type: "grok_session_update",
+        sessionKey: this.sessionKey,
+        update,
+      });
       return;
     }
     switch (update.sessionUpdate) {
@@ -472,7 +526,9 @@ class GrokAgentProcess {
     if (turn.openKind !== kind) {
       this.closeOpenBlock(turn);
       turn.content.push(
-        kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" },
+        kind === "text"
+          ? { type: "text", text: "" }
+          : { type: "thinking", thinking: "" },
       );
       turn.openIndex = turn.content.length - 1;
       turn.openKind = kind;
@@ -511,7 +567,8 @@ class GrokAgentProcess {
       toolCallId: update.toolCallId,
       toolName: name,
       args: block.arguments,
-      execKind: update.kind ?? (SHELL_TOOL_NAMES.has(name) ? "execute" : undefined),
+      execKind:
+        update.kind ?? (SHELL_TOOL_NAMES.has(name) ? "execute" : undefined),
     });
     if (update.status === "completed" || update.status === "failed") {
       this.finishToolCall(turn, index, update);
@@ -539,7 +596,12 @@ class GrokAgentProcess {
     this.emitUpdate(turn, {
       type: "toolcall_end",
       contentIndex: index,
-      toolCall: { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments },
+      toolCall: {
+        type: "toolCall",
+        id: block.id,
+        name: block.name,
+        arguments: block.arguments,
+      },
     });
     this.emit({
       type: "tool_execution_end",
@@ -574,10 +636,14 @@ class GrokAgentProcess {
             : "A Grok turn is already in progress",
       };
 
-    const promptBlocks = [{ type: "text", text: message }];
+    const promptBlocks = [{ type: "text", text: withClarifyPrefix(message) }];
     for (const image of images ?? []) {
       if (image?.data && image?.mimeType)
-        promptBlocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+        promptBlocks.push({
+          type: "image",
+          data: image.data,
+          mimeType: image.mimeType,
+        });
     }
 
     const userMessage = {
@@ -587,8 +653,16 @@ class GrokAgentProcess {
     };
     this.emit({ type: "agent_start", sessionKey: this.sessionKey });
     this.emit({ type: "turn_start", sessionKey: this.sessionKey });
-    this.emit({ type: "message_start", sessionKey: this.sessionKey, message: userMessage });
-    this.emit({ type: "message_end", sessionKey: this.sessionKey, message: userMessage });
+    this.emit({
+      type: "message_start",
+      sessionKey: this.sessionKey,
+      message: userMessage,
+    });
+    this.emit({
+      type: "message_end",
+      sessionKey: this.sessionKey,
+      message: userMessage,
+    });
 
     const assistantMessage = {
       role: "assistant",
@@ -600,7 +674,11 @@ class GrokAgentProcess {
       stopReason: "pending",
       timestamp: Date.now(),
     };
-    this.emit({ type: "message_start", sessionKey: this.sessionKey, message: assistantMessage });
+    this.emit({
+      type: "message_start",
+      sessionKey: this.sessionKey,
+      message: assistantMessage,
+    });
 
     this.turn = {
       content: assistantMessage.content,
@@ -617,7 +695,11 @@ class GrokAgentProcess {
       });
       this.closeOpenBlock(this.turn);
       assistantMessage.stopReason = response.stopReason;
-      this.emit({ type: "turn_end", sessionKey: this.sessionKey, message: assistantMessage });
+      this.emit({
+        type: "turn_end",
+        sessionKey: this.sessionKey,
+        message: assistantMessage,
+      });
       this.emit({
         type: "agent_end",
         sessionKey: this.sessionKey,
@@ -649,7 +731,9 @@ class GrokAgentProcess {
   // plain prompt text as far as ACP is concerned -- grok's harness parses
   // the leading "/name" itself, same convention its own CLI uses.
   compact(customInstructions) {
-    const text = customInstructions ? `/compact ${customInstructions}` : "/compact";
+    const text = customInstructions
+      ? `/compact ${customInstructions}`
+      : "/compact";
     return this.runTurn("prompt", text);
   }
 
@@ -689,14 +773,18 @@ class GrokAgentProcess {
   // supports multiple sessionIds per connection, so this doesn't need to
   // respawn the child the way switchSession does.
   async newSession() {
-    if (!this.connection) return { ok: false, error: "Grok process is not running" };
+    if (!this.connection)
+      return { ok: false, error: "Grok process is not running" };
     try {
       const session = await this.connection.newSession({
         cwd: this.cwd ?? homedir(),
         mcpServers: [],
       });
       this.sessionId = session.sessionId;
-      this.sessionFile = sessionFilePathFor(this.cwd ?? homedir(), this.sessionId);
+      this.sessionFile = sessionFilePathFor(
+        this.cwd ?? homedir(),
+        this.sessionId,
+      );
       this.messages = [];
       this.availableCommands = [];
       return { ok: true, state: await this.getState() };
@@ -712,11 +800,17 @@ class GrokAgentProcess {
   // Fail clearly rather than guess at a protocol extension and risk silently
   // corrupting session state.
   async forkAt() {
-    return { ok: false, error: "Forking a Grok conversation isn't supported yet." };
+    return {
+      ok: false,
+      error: "Forking a Grok conversation isn't supported yet.",
+    };
   }
 
   async truncateAt() {
-    return { ok: false, error: "Rewinding a Grok conversation isn't supported yet." };
+    return {
+      ok: false,
+      error: "Rewinding a Grok conversation isn't supported yet.",
+    };
   }
 
   async getState() {
@@ -755,7 +849,8 @@ class GrokAgentProcess {
       },
       signal: AbortSignal.timeout(8000),
     });
-    if (!response.ok) throw new Error(`models fetch failed: ${response.status}`);
+    if (!response.ok)
+      throw new Error(`models fetch failed: ${response.status}`);
     const payload = await response.json();
     const raw = Array.isArray(payload)
       ? payload
@@ -786,11 +881,15 @@ class GrokAgentProcess {
     try {
       const raw = await this.fetchModelCatalog();
       const currentId = this.model?.id ?? raw[0]?.id ?? raw[0]?.model;
-      const current = raw.find((m) => (m.id ?? m.model) === currentId) ?? raw[0];
+      const current =
+        raw.find((m) => (m.id ?? m.model) === currentId) ?? raw[0];
       const efforts = Array.isArray(current?.reasoning_efforts)
         ? current.reasoning_efforts
         : [];
-      return { ok: true, levels: efforts.map((effort) => effort.id ?? effort.value) };
+      return {
+        ok: true,
+        levels: efforts.map((effort) => effort.id ?? effort.value),
+      };
     } catch (error) {
       return { ok: false, error: String(error?.message ?? error) };
     }
@@ -800,7 +899,10 @@ class GrokAgentProcess {
     this.model = { provider, id: modelId };
     if (this.connection && this.sessionId) {
       try {
-        await this.connection.setSessionMode({ sessionId: this.sessionId, modeId: modelId });
+        await this.connection.setSessionMode({
+          sessionId: this.sessionId,
+          modeId: modelId,
+        });
       } catch (error) {
         return { ok: false, error: String(error?.message ?? error) };
       }
@@ -811,7 +913,10 @@ class GrokAgentProcess {
   async setThinkingLevel(level) {
     if (this.connection && this.sessionId) {
       try {
-        await this.connection.setSessionMode({ sessionId: this.sessionId, modeId: level });
+        await this.connection.setSessionMode({
+          sessionId: this.sessionId,
+          modeId: level,
+        });
       } catch (error) {
         return { ok: false, error: String(error?.message ?? error) };
       }
@@ -821,7 +926,11 @@ class GrokAgentProcess {
 
   async getUsage(force = false) {
     const now = Date.now();
-    if (!force && this.usageCache.result && now - this.usageCache.at < 5 * 60_000) {
+    if (
+      !force &&
+      this.usageCache.result &&
+      now - this.usageCache.at < 5 * 60_000
+    ) {
       return this.usageCache.result;
     }
     if (this.usageRequest) return this.usageRequest;
@@ -840,7 +949,10 @@ class GrokAgentProcess {
     try {
       const token = await readGrokToken();
       if (!token)
-        return { ok: true, usage: { available: false, provider: "Grok", windows: [] } };
+        return {
+          ok: true,
+          usage: { available: false, provider: "Grok", windows: [] },
+        };
       const response = await fetch(`${PROXY_BASE}/billing?format=credits`, {
         headers: {
           Accept: "application/json",
@@ -849,15 +961,24 @@ class GrokAgentProcess {
         },
         signal: AbortSignal.timeout(10_000),
       });
-      if (!response.ok) throw new Error(`Grok usage returned ${response.status}`);
+      if (!response.ok)
+        throw new Error(`Grok usage returned ${response.status}`);
       const payload = await response.json();
       const config = payload?.config ?? payload;
       const usedPercent = Number(config?.creditUsagePercent);
       const resetAt =
-        Date.parse(String(config?.currentPeriod?.end ?? config?.billingPeriodEnd ?? "")) / 1000;
+        Date.parse(
+          String(config?.currentPeriod?.end ?? config?.billingPeriodEnd ?? ""),
+        ) / 1000;
       const resetsAt = formatResetTime(resetAt);
       const windows = Number.isFinite(usedPercent)
-        ? [{ label: "Current week", usedPercent, ...(resetsAt ? { resetsAt } : {}) }]
+        ? [
+            {
+              label: "Current week",
+              usedPercent,
+              ...(resetsAt ? { resetsAt } : {}),
+            },
+          ]
         : [];
       return {
         ok: true,
@@ -898,7 +1019,11 @@ class GrokAgentProcess {
     this.turn = undefined;
     this.replayMode = undefined;
     this.killChild();
-    this.emit({ type: "__status", sessionKey: this.sessionKey, status: "stopped" });
+    this.emit({
+      type: "__status",
+      sessionKey: this.sessionKey,
+      status: "stopped",
+    });
   }
 }
 

@@ -130,6 +130,14 @@ export class Timeline {
   status: RunStatus = "stopped";
   state: SessionState | null = null;
   cycle = 0;
+  /**
+   * The generated session title, kept outside `state` on purpose. It arrives
+   * as its own background event and every later `state` event from the
+   * backend would otherwise clobber it back to the prompt-derived fallback
+   * (pi only reports the name it knew when the process started), making the
+   * label flicker between the two.
+   */
+  private sessionName: string | undefined;
   private listeners = new Set<() => void>();
   /** Pending in-flight text streams, applied as whole chunks (no per-char cursor). */
   private streams = new Map<
@@ -142,7 +150,13 @@ export class Timeline {
     }
   >();
 
-  constructor(public readonly key: string) {}
+  readonly key: string;
+
+  // Written out rather than a parameter property so `node --test` can load
+  // this module directly (strip-only TypeScript rejects those).
+  constructor(key: string) {
+    this.key = key;
+  }
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -328,11 +342,115 @@ export class Timeline {
     this.notify();
   }
 
+  /**
+   * Rebuild the in-flight turn from the server's runtime event log after a
+   * reload. hydrate() only sees the session file, which records completed
+   * turns — everything streamed since (partial text, running tool cards,
+   * todo snapshots) exists only in the server-side log. Entries are fed
+   * through the same handle() path live events use, so reconstructed items
+   * merge seamlessly with events that keep arriving over SSE: deltas unify
+   * by stream key (claude tags one explicitly; pi/grok fall back to the same
+   * cycle default), and entries already received live are skipped by log id.
+   *
+   * Returns "live" if the current run was reconstructed, "settled" if the
+   * run finished while the log was being fetched (the caller should re-read
+   * the session file instead — the messages are persisted by now), or
+   * "none" when no safe replay window exists.
+   */
+  replayLiveTurn(entries: BackendLogEntry[]): "live" | "settled" | "none" {
+    if (!Array.isArray(entries) || entries.length === 0) return "none";
+    const agentEntries = entries.filter(
+      (entry) =>
+        entry && typeof entry.id === "string" && entry.source !== "server",
+    );
+    if (agentEntries.length === 0) return "none";
+
+    // The current run is everything after the last completed run's
+    // agent_end. A grok resume also replays its history through the log as
+    // complete agent_start…agent_end turns, so those are correctly excluded.
+    let windowStart = 0;
+    for (let index = 0; index < agentEntries.length; index += 1) {
+      if (String(agentEntries[index]?.payload?.type ?? "") === "agent_end") {
+        windowStart = index + 1;
+      }
+    }
+    const window = agentEntries.slice(windowStart);
+    // The run completed before the log was fetched: its messages are in the
+    // session file now, so the caller re-reads them instead of replaying.
+    if (window.length === 0) return "settled";
+    // A log with no agent_end and not opening at a run boundary is a torn
+    // ring buffer (truncated mid-run) — replaying it would duplicate
+    // persisted turns, so degrade to showing the saved history.
+    if (
+      windowStart === 0 &&
+      !["agent_start", "turn_start", "message_start"].includes(
+        String(window[0]?.payload?.type ?? ""),
+      )
+    ) {
+      return "none";
+    }
+    // grok emits agent_settled after agent_end; pi/claude may have trailing
+    // state events post-completion. Any end-of-run marker inside the window
+    // means the run settled during the fetch.
+    if (
+      window.some((entry) =>
+        ["agent_end", "agent_settled"].includes(
+          String(entry.payload?.type ?? ""),
+        ),
+      )
+    ) {
+      return "settled";
+    }
+
+    const seenLive = new Set(this.backendLog.map((entry) => entry.id));
+    for (const entry of window) {
+      // Events that already arrived over SSE after the reload were applied
+      // live; replaying them would duplicate their items.
+      if (seenLive.has(entry.id)) continue;
+      const payload = asRecord(entry.payload);
+      const type = String(payload.type ?? "");
+      // Keep this.cycle aligned with post-reload live events (which arrive
+      // without a turn_start): deltas must map to the same item ids.
+      if (type === "turn_start") continue;
+      if (
+        type === "message_start" &&
+        asRecord(payload.message).role === "user"
+      ) {
+        const message = asRecord(payload.message);
+        const text = extractHistoryText(message.content, "[Image attachment]");
+        if (!text) continue;
+        // The in-flight turn's user message was never persisted, so it can't
+        // be in the hydrated items — dedupe only guards the tiny race where
+        // it already arrived live between SSE connect and this replay.
+        let lastUserText: string | undefined;
+        for (let index = this.items.length - 1; index >= 0; index -= 1) {
+          const item = this.items[index];
+          if (item?.kind === "user") {
+            lastUserText = item.text;
+            break;
+          }
+        }
+        if (lastUserText === text) continue;
+        this.appendUser(text);
+        continue;
+      }
+      this.handle({
+        ...payload,
+        sessionKey: this.key,
+        __logId: entry.id,
+        __loggedAt: entry.timestamp,
+        __logSource: entry.source,
+      } as unknown as AgentEvent);
+    }
+    this.markPendingRun();
+    return "live";
+  }
+
   reset(state: SessionState | null = this.state) {
     this.items = [];
     this.streams.clear();
     this.cycle = 0;
-    this.state = state;
+    this.state = state ? this.withSessionName(state) : state;
     this.status = state?.isStreaming ? "working" : "ready";
     this.notify();
   }
@@ -463,7 +581,7 @@ export class Timeline {
     this.items = items;
     this.streams.clear();
     this.cycle = 0;
-    this.state = state;
+    this.state = this.withSessionName(state);
     this.status = state.isStreaming ? "working" : "ready";
     // History is a finished transcript. A toolCall without a matching
     // toolResult means the turn died mid-command (backend restart, lost
@@ -481,9 +599,53 @@ export class Timeline {
     this.notify();
   }
 
+  /**
+   * Adopt a title that was resolved outside the event stream (the saved
+   * session list, which the sidebar refreshes on its own schedule). Keeps a
+   * reload showing the generated title even if the SSE event that first
+   * announced it belonged to the previous page's session key.
+   */
+  applySessionName(name: string) {
+    const title = name.trim();
+    if (!title || title === this.sessionName) return;
+    this.sessionName = title;
+    if (this.state) this.state = { ...this.state, sessionName: title };
+    this.notify();
+  }
+
+  /** Re-applies the sticky generated title over any state the backend reports. */
+  private withSessionName(state: SessionState): SessionState {
+    if (!this.sessionName) {
+      if (state.sessionName) this.sessionName = state.sessionName;
+      return state;
+    }
+    return state.sessionName === this.sessionName
+      ? state
+      : { ...state, sessionName: this.sessionName };
+  }
+
   setState(state: SessionState) {
-    this.state = state;
+    this.state = this.withSessionName(state);
     this.status = state.isStreaming ? "working" : "ready";
+    this.notify();
+  }
+
+  /**
+   * Optimistic "the request was sent" state, set the instant the user sends
+   * — the RPC prompt response only resolves when the whole turn completes,
+   * and a stalled model call left the UI silent with no stop affordance.
+   * Cleared by the next real agent_settled/state event, or explicitly when
+   * the prompt fails.
+   */
+  markPendingRun() {
+    this.status = "working";
+    if (this.state) this.state = { ...this.state, isStreaming: true };
+    this.notify();
+  }
+
+  clearPendingRun() {
+    this.status = "ready";
+    if (this.state) this.state = { ...this.state, isStreaming: false };
     this.notify();
   }
 
@@ -780,6 +942,18 @@ export class Timeline {
 
     if (event.type === "state") {
       this.setState(event.state as SessionState);
+      return;
+    }
+
+    if (event.type === "session_title_set") {
+      const title = typeof event.title === "string" ? event.title.trim() : "";
+      if (!title || title === this.sessionName) return;
+      // Remember it even when no state has arrived yet: the title is
+      // generated in the background and can land before the first state
+      // event, and dropping it there left the label on its fallback.
+      this.sessionName = title;
+      if (this.state) this.state = { ...this.state, sessionName: title };
+      this.notify();
       return;
     }
   }

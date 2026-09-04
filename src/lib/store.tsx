@@ -26,6 +26,7 @@ import {
 } from "./api";
 import { Timeline } from "./timeline";
 import { savedSessionTitle } from "./sessionTitle";
+import { isAwaitingAnswer } from "./awaitingAnswer";
 import {
   CLAUDE_DEFAULT_EFFORT,
   CLAUDE_DEFAULT_MODEL,
@@ -54,6 +55,8 @@ interface StoreValue {
   activeKey: string;
   active: ConversationTab | undefined;
   workingKeys: ReadonlySet<string>;
+  /** Sessions whose last turn ended on a question and are parked on an answer. */
+  awaitingKeys: ReadonlySet<string>;
   resumeSessions: ResumeSession[];
   archivedSessions: ResumeSession[];
   openConversation: (
@@ -146,6 +149,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workingKeys, setWorkingKeys] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [awaitingKeys, setAwaitingKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [resumeSessions, setResumeSessions] = useState<ResumeSession[]>([]);
   const [archivedSessions, setArchivedSessions] = useState<ResumeSession[]>([]);
   const [workspaceReveal, setWorkspaceReveal] = useState<{
@@ -224,10 +230,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         else next.delete(key);
         return next;
       });
-      if (event.type === "agent_settled") refreshSessions();
+      if (event.type === "agent_settled" || event.type === "session_title_set")
+        refreshSessions();
     });
     return unsubscribe;
   }, [refreshSessions]);
+
+  // The generated title reaches the UI two ways: the session_title_set event
+  // (live) and the saved session list (a reload, where that event belonged to
+  // the previous page's session key). Feed the saved title into the timeline
+  // so both paths land on the same sticky value instead of leaving a
+  // refreshed tab on its prompt-derived — or cwd-derived — fallback.
+  useEffect(() => {
+    if (resumeSessions.length === 0) return;
+    const savedByPath = new Map(
+      resumeSessions.map((session) => [session.path, session]),
+    );
+    for (const tab of tabsRef.current) {
+      const path = tab.sessionPath ?? tab.timeline.state?.sessionFile;
+      const saved = path ? savedByPath.get(path) : undefined;
+      if (!saved?.name) continue;
+      // sessions.js falls back to `name || firstPrompt`; only a name that is
+      // genuinely stored on the session is a real title.
+      if (saved.name.trim() === (saved.firstPrompt ?? "").trim()) continue;
+      tab.timeline.applySessionName(saved.name);
+    }
+  }, [resumeSessions]);
 
   useEffect(() => {
     const refreshWhenVisible = () => {
@@ -242,6 +270,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       window.clearInterval(timer);
     };
   }, [refreshSessions]);
+
+  useEffect(() => {
+    const recompute = () => {
+      setAwaitingKeys((current) => {
+        const next = new Set<string>();
+        for (const tab of tabsRef.current) {
+          if (
+            isAwaitingAnswer(
+              tab.timeline.items,
+              timelineIsWorking(tab.timeline),
+            )
+          )
+            next.add(tab.key);
+        }
+        if (
+          next.size === current.size &&
+          [...next].every((key) => current.has(key))
+        )
+          return current;
+        return next;
+      });
+    };
+    recompute();
+    // Timeline subscriptions, not the SSE stream: sending a prompt answers the
+    // question locally and emits no server event, and the badge has to clear
+    // right then rather than when the backend next says something.
+    const unsubscribes = tabs.map((tab) => tab.timeline.subscribe(recompute));
+    return () => {
+      for (const unsubscribe of unsubscribes) unsubscribe();
+    };
+  }, [tabs]);
 
   const createConversationTab = useCallback(
     (
@@ -371,6 +430,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return openConversation(cwd);
   }, [openConversation]);
 
+  /**
+   * A reload during an executing turn loses everything streamed since the
+   * turn began: the session file only records completed turns, so the
+   * in-flight user message, partial assistant text, running tool cards, and
+   * todo snapshots vanish. The server's runtime event log holds every event
+   * of the live run — replaying it reconstructs the transcript and merges
+   * with events that keep arriving over SSE. If the run settled while the
+   * log was being fetched, its messages are persisted by then, so the
+   * session file is re-read instead.
+   */
+  const restoreLiveTurn = useCallback((key: string, timeline: Timeline) => {
+    void api.backendLog(key).then((result) => {
+      if (!result.ok || !Array.isArray(result.entries)) return;
+      const outcome = timeline.replayLiveTurn(result.entries);
+      if (outcome === "live") return;
+      // "settled" means the run finished while the log was in flight;
+      // "none" means the log was too torn to replay. Either way the tail of
+      // the turn is missing from what was hydrated a moment ago — including,
+      // when the run ended on a question, the question itself, which left the
+      // session looking like it had simply stopped. The session file has it.
+      const sessionFile = timeline.state?.sessionFile;
+      if (!sessionFile) return;
+      void api.sessionMessages(sessionFile).then((refreshed) => {
+        if (!refreshed.ok || !Array.isArray(refreshed.messages)) return;
+        const state = timeline.state;
+        if (!state) return;
+        // A new turn may have started in the meantime (the user sent another
+        // prompt); re-reading the file would drop its live items.
+        if (timeline.status === "working" && outcome === "none") return;
+        timeline.hydrate(refreshed.messages, { ...state, isStreaming: false });
+      });
+    });
+  }, []);
+
   const resumeConversation = useCallback(
     (session: ResumeSession): string => {
       const existing = tabsRef.current.find(
@@ -455,12 +548,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           result.messages.length === 0
         )
           return;
+        // Never let a from-disk hydration clobber a live run: if a
+        // mid-turn reload adopted the streaming agent, this late-arriving
+        // read is stale by definition.
+        if (timeline.state?.isStreaming) return;
         timeline.hydrate(result.messages, {
           ...(timeline.state ?? placeholderState),
           isStreaming: false,
         });
       });
-      if (tab.backend === "grok") return tab.key;
+      if (tab.backend === "grok") {
+        // Grok stays lazy for viewing — but a live process running this
+        // session (page refreshed mid-turn) is adopted, never spawned, so
+        // the in-flight run re-attaches without paying the ghost-session
+        // cost that made grok lazy in the first place.
+        void api
+          .start(
+            tab.key,
+            session.cwd,
+            "grok",
+            undefined,
+            session.path,
+            undefined,
+            true,
+          )
+          .then((adopted) => {
+            if (!adopted.ok || !adopted.state?.isStreaming) return;
+            // Order matters: mark streaming first (guards the generic
+            // hydration above), then persisted history, then the replayed
+            // live run on top of it.
+            timeline.setState(adopted.state);
+            void api.sessionMessages(session.path).then((persisted) => {
+              if (
+                persisted.ok &&
+                Array.isArray(persisted.messages) &&
+                persisted.messages.length > 0 &&
+                adopted.state
+              ) {
+                timeline.hydrate(persisted.messages, adopted.state);
+              }
+              void restoreLiveTurn(tab.key, timeline);
+            });
+          });
+        return tab.key;
+      }
       void api
         .start(
           tab.key,
@@ -504,6 +635,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ),
             );
             refreshSessions();
+            if (resumedState.isStreaming) {
+              // A refresh that adopted a live process must never fall through
+              // to the resume branch below: switch_session aborts a running
+              // turn ("request was aborted"), which is exactly the state the
+              // reload was supposed to preserve. Restore it in place instead —
+              // persisted history first (adopting returns state only), then
+              // the in-flight turn, which exists solely in the server's
+              // runtime log: partial text, tool cards, and todos.
+              if (
+                !Array.isArray(startResult.messages) ||
+                startResult.messages.length === 0
+              ) {
+                const persisted = await api.sessionMessages(session.path);
+                if (
+                  persisted.ok &&
+                  Array.isArray(persisted.messages) &&
+                  persisted.messages.length > 0
+                ) {
+                  timeline.hydrate(persisted.messages, resumedState);
+                }
+              }
+              void restoreLiveTurn(tab.key, timeline);
+              return;
+            }
             if (timeline.items.length > 0) return;
           }
           const result = await api.resume(tab.key, session.path);
@@ -522,6 +677,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ),
             );
             refreshSessions();
+            if (result.state.isStreaming)
+              void restoreLiveTurn(tab.key, timeline);
           } else {
             timeline.reset(startResult.state ?? null);
             timeline.appendNotice(
@@ -542,7 +699,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         });
       return tab.key;
     },
-    [createConversationTab, refreshSessions],
+    [createConversationTab, refreshSessions, restoreLiveTurn],
   );
 
   // A forked branch becomes its own conversation: seeded instantly with the
@@ -840,6 +997,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     activeKey,
     active,
     workingKeys,
+    awaitingKeys,
     resumeSessions,
     archivedSessions,
     openConversation,

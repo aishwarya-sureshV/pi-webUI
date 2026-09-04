@@ -55,10 +55,32 @@ export interface ResumeSession {
   messageCount: number;
   backend: AgentBackend;
   firstPrompt?: string;
+  /** Tail of the final assistant message, when it is the last message in the
+   *  session — the sidebar runs the awaiting-answer rule on it. */
+  lastAssistantText?: string;
   lastModel?: string;
   /** Every model that produced a turn in this session, including one-off swaps. */
   models?: string[];
   lastEffort?: string;
+}
+
+export interface GitChange {
+  path: string;
+  status: "added" | "modified" | "deleted";
+  additions: number;
+  deletions: number;
+}
+
+export interface GitChangesResponse {
+  ok: boolean;
+  error?: string;
+  /** False when cwd is not a git repo. */
+  repo?: boolean;
+  /** True when an origin remote exists (push target available). */
+  connected?: boolean;
+  remote?: string;
+  branch?: string;
+  changes?: GitChange[];
 }
 
 export interface SlashCommand {
@@ -372,6 +394,7 @@ export const api = {
     model?: ModelInfo,
     sessionPath?: string,
     thinkingLevel?: string,
+    adoptOnly?: boolean,
   ) =>
     post<{
       ok: boolean;
@@ -384,6 +407,7 @@ export const api = {
       ...(model ? { model } : {}),
       ...(sessionPath ? { sessionPath } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
+      ...(adoptOnly ? { adoptOnly: true } : {}),
     }),
   prompt: (
     key: string,
@@ -443,6 +467,20 @@ export const api = {
     post<{ ok: boolean; output?: string; error?: string }>(
       `/api/${key}/git`,
       { cwd, op },
+      120_000,
+    ),
+  gitChanges: (key: string, cwd: string) =>
+    get<GitChangesResponse>(
+      `/api/${key}/git-changes?cwd=${encodeURIComponent(cwd)}`,
+    ),
+  gitFileDiff: (key: string, cwd: string, file: string) =>
+    get<{ ok: boolean; diff?: string; error?: string }>(
+      `/api/${key}/git-changes?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}`,
+    ),
+  gitCommitPush: (key: string, cwd: string, message: string) =>
+    post<{ ok: boolean; output?: string; error?: string }>(
+      `/api/${key}/git`,
+      { cwd, op: "commit-push", message },
       120_000,
     ),
   compact: (key: string, customInstructions?: string) =>
@@ -514,10 +552,9 @@ export const api = {
     ),
   /** Exchange the token for a session cookie + one-time SSE/WS ticket. */
   auth: (token: string) =>
-    post<{ ok: boolean; enabled?: boolean; ticket?: string }>(
-      "/api/auth",
-      { token },
-    ),
+    post<{ ok: boolean; enabled?: boolean; ticket?: string }>("/api/auth", {
+      token,
+    }),
   authStatus: () => get<{ ok: boolean }>("/api/auth/status"),
   /** Renew the server-side lease for the given conversation keys. */
   heartbeat: (keys: string[]) =>
