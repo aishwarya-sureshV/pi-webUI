@@ -1,10 +1,14 @@
 import {
+  Fragment,
   useEffect,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  type FormEvent,
 } from 'react'
 import { StoreProvider, useStore } from './lib/store'
+import { AuthError, api, setAuthToken } from './lib/api'
 import { Sidebar } from './components/Sidebar'
 import { Conversation } from './components/Conversation'
 import { WorkbenchPage } from './components/WorkbenchPage'
@@ -52,9 +56,6 @@ function Frame() {
     if (key) setActiveKey(key)
     setSplitSessions(false)
     setSplitSessionKeys([])
-    for (const tab of tabs) {
-      if (tab.key !== key) closeConversation(tab.key)
-    }
   }
 
   const splitWithSession = (key: string) => {
@@ -154,7 +155,7 @@ function Frame() {
         onSplitSessionsToggle={toggleSplitSessions}
         onSessionFocus={focusSession}
         onSessionSplit={splitWithSession}
-        openTabKeys={visibleTabs.map((tab) => tab.key)}
+        openTabKeys={tabs.map((tab) => tab.key)}
         onResizePointerDown={startSidebarResize}
         onResizeKeyDown={resizeSidebarWithKeyboard}
       />
@@ -162,38 +163,48 @@ function Frame() {
         {view === 'sessions'
           ? (
               <>
-                {visibleTabs.length > 0 ? (
+                {tabs.length > 0 ? (
                   <div className={`session-grid${visibleTabs.length > 1 ? ' is-split' : ''}`}>
-                    {visibleTabs.map((tab, index) => (
-                      <div className="session-pane-slot" key={tab.key}>
-                        <section
-                          className={`session-pane${tab.key === activeKey ? ' is-active' : ''}`}
-                          aria-label={`Session ${tab.label}`}
-                          style={paneWidths[tab.key] ? { flexBasis: `${paneWidths[tab.key]}px`, width: `${paneWidths[tab.key]}px` } : undefined}
-                          onPointerDownCapture={() => setActiveKey(tab.key)}
-                        >
-                          <Conversation
-                            tab={tab}
-                            split={visibleTabs.length > 1}
-                            paneIndex={index}
-                            paneCount={visibleTabs.length}
-                            onClose={visibleTabs.length > 1 ? () => closeConversation(tab.key) : undefined}
-                          />
-                        </section>
-                        {index < visibleTabs.length - 1 && (
-                          <button
-                            type="button"
-                            className="session-resizer"
-                            role="separator"
-                            aria-orientation="vertical"
-                            aria-label={`Resize ${tab.label}`}
-                            title="Drag to resize session"
-                            onPointerDown={(event) => startPaneResize(event, tab.key)}
-                            onKeyDown={(event) => resizePaneWithKeyboard(event, tab.key)}
-                          />
-                        )}
-                      </div>
-                    ))}
+                    {tabs.map((tab) => {
+                      const visibleIndex = visibleTabs.findIndex((visible) => visible.key === tab.key)
+                      const visible = visibleIndex >= 0
+                      return (
+                        <Fragment key={tab.key}>
+                          <div
+                            className={`session-pane-slot${visible ? '' : ' is-background'}`}
+                            hidden={!visible}
+                            aria-hidden={!visible}
+                          >
+                            <section
+                              className={`session-pane${tab.key === activeKey ? ' is-active' : ''}`}
+                              aria-label={`Session ${tab.label}`}
+                              style={visible && paneWidths[tab.key] ? { flexBasis: `${paneWidths[tab.key]}px`, width: `${paneWidths[tab.key]}px` } : undefined}
+                              onPointerDownCapture={() => setActiveKey(tab.key)}
+                            >
+                              <Conversation
+                                tab={tab}
+                                split={visibleTabs.length > 1}
+                                paneIndex={Math.max(0, visibleIndex)}
+                                paneCount={Math.max(1, visibleTabs.length)}
+                                onClose={visible && visibleTabs.length > 1 ? () => closeConversation(tab.key) : undefined}
+                              />
+                            </section>
+                          </div>
+                          {visible && visibleIndex < visibleTabs.length - 1 && (
+                            <button
+                              type="button"
+                              className="session-resizer"
+                              role="separator"
+                              aria-orientation="vertical"
+                              aria-label={`Resize ${tab.label}`}
+                              title="Drag to resize session"
+                              onPointerDown={(event) => startPaneResize(event, tab.key)}
+                              onKeyDown={(event) => resizePaneWithKeyboard(event, tab.key)}
+                            />
+                          )}
+                        </Fragment>
+                      )
+                    })}
                   </div>
                 ) : <EmptyCenter />}
               </>
@@ -226,8 +237,90 @@ function EmptyCenter() {
 
 export function App() {
   return (
-    <StoreProvider>
-      <Frame />
-    </StoreProvider>
+    <AuthGate>
+      <StoreProvider>
+        <Frame />
+      </StoreProvider>
+    </AuthGate>
   )
+}
+
+/**
+ * Token gate: when the server has PI_WEB_TOKEN set, every API call 401s until
+ * the user enters the token. The token is exchanged for an HttpOnly cookie
+ * (same-origin) and a one-time ticket (cross-origin EventSource/WebSocket),
+ * then stored locally so later requests carry the Authorization header.
+ */
+function AuthGate({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<'checking' | 'authed' | 'denied'>('checking')
+  const [token, setToken] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .authStatus()
+      .then(() => {
+        if (!cancelled) setState('authed')
+      })
+      .catch((err) => {
+        if (cancelled) return
+        if (err instanceof AuthError) setState('denied')
+        else setState('authed') // server unreachable; let the app surface it
+      })
+    // A token rotation or expiry mid-session re-locks the UI instead of
+    // failing silently per-request.
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      if (event.reason instanceof AuthError) setState('denied')
+    }
+    window.addEventListener('unhandledrejection', onUnhandled)
+    return () => {
+      cancelled = true
+      window.removeEventListener('unhandledrejection', onUnhandled)
+    }
+  }, [])
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    try {
+      const result = await api.auth(token.trim())
+      if (!result.ok) {
+        setError('Invalid token.')
+        return
+      }
+      setAuthToken(token.trim())
+      setState('authed')
+    } catch {
+      setError('Could not reach the server.')
+    }
+  }
+
+  if (state === 'checking') {
+    return (
+      <div className="auth-gate">
+        <div className="auth-gate__card">Checking…</div>
+      </div>
+    )
+  }
+  if (state === 'denied') {
+    return (
+      <div className="auth-gate">
+        <form className="auth-gate__card" onSubmit={submit}>
+          <h1>pi-web is locked</h1>
+          <p>The server requires a token. Enter the value of PI_WEB_TOKEN to continue.</p>
+          <input
+            type="password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            placeholder="PI_WEB_TOKEN"
+            autoFocus
+          />
+          <button type="submit">Unlock</button>
+          {error && <p className="auth-gate__error">{error}</p>}
+        </form>
+      </div>
+    )
+  }
+  return <>{children}</>
 }

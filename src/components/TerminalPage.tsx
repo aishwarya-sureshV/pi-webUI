@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { apiOrigin, api, hasAuthToken } from '../lib/api'
 
 const LIGHT_THEME = {
   background: '#f4f1e9', foreground: '#231f19', cursor: '#b05d13', cursorAccent: '#f4f1e9',
@@ -128,30 +129,46 @@ function TerminalSession({ cwd, theme, active, onStatus }: {
     terminalRef.current = terminal
     fitRef.current = fit
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(`${protocol}//${window.location.host}/api/terminal?cwd=${encodeURIComponent(cwd || '')}`)
-    socketRef.current = socket
-    socket.addEventListener('open', () => {
-      statusCallbackRef.current('ready')
-      socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }))
-    })
-    socket.addEventListener('message', (event) => terminal.write(String(event.data)))
-    socket.addEventListener('close', () => statusCallbackRef.current('closed'))
-    socket.addEventListener('error', () => terminal.write('\r\n\x1b[31mTerminal connection failed.\x1b[0m\r\n'))
+    const origin = apiOrigin() || `${window.location.protocol}//${window.location.host}`
+    const wsOrigin = origin.replace(/^http/i, 'ws')
+    // WebSocket cannot send Authorization headers, so with a token configured
+    // the connection authenticates with a one-time ticket (cross-origin) or
+    // the HttpOnly cookie (same-origin, sent automatically).
+    const connect = async () => {
+      let url = `${wsOrigin}/api/terminal?cwd=${encodeURIComponent(cwd || '')}`
+      if (hasAuthToken()) {
+        try {
+          const result = await api.auth(hasAuthToken() ? (localStorage.getItem('pi-web.token') ?? '') : '')
+          if (result.ok && result.ticket) url = `${url}&ticket=${encodeURIComponent(result.ticket)}`
+        } catch {
+          /* cookie may already authenticate; fall through */
+        }
+      }
+      const socket = new WebSocket(url)
+      socketRef.current = socket
+      socket.addEventListener('open', () => {
+        statusCallbackRef.current('ready')
+        socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }))
+      })
+      socket.addEventListener('message', (event) => terminal.write(String(event.data)))
+      socket.addEventListener('close', () => statusCallbackRef.current('closed'))
+      socket.addEventListener('error', () => terminal.write('\r\n\x1b[31mTerminal connection failed.\x1b[0m\r\n'))
+    }
+    void connect()
 
     const input = terminal.onData((data) => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }))
+      if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'input', data }))
     })
     const resizeObserver = new ResizeObserver(() => {
       fit.fit()
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }))
+      if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }))
     })
     resizeObserver.observe(host)
 
     return () => {
       resizeObserver.disconnect()
       input.dispose()
-      socket.close()
+      socketRef.current?.close()
       terminal.dispose()
       terminalRef.current = null
       fitRef.current = null
