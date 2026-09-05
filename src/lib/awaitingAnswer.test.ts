@@ -75,4 +75,17 @@ describe("isAwaitingAnswer", () => {
       true,
     );
   });
+
+  it("flags an ask fence even without a trailing question mark", () => {
+    const text = [
+      "```ask",
+      JSON.stringify({
+        questions: [
+          { question: "Which page?", options: [{ label: "Fleet" }] },
+        ],
+      }),
+      "```",
+    ].join("\n");
+    assert.equal(isAwaitingAnswer([assistant(text)], false), true);
+  });
 });

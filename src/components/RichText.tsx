@@ -1,23 +1,51 @@
 import { memo, type JSX, type ReactNode } from 'react'
 import { highlightCode, NumberedCode } from '../lib/highlight'
 import { CopyButton } from './CopyButton'
+import { AskCard } from './AskCard'
+import { firstAsk, hasAskBlock, parseAsk } from '../lib/askBlock'
 
 type Segment =
   | { type: 'prose'; text: string }
   | { type: 'code'; text: string; language?: string }
 
-export const RichText = memo(function RichText({ text, live = false }: { text: string; live?: boolean }) {
+export const RichText = memo(function RichText({ text, live = false, onAnswer }: { text: string; live?: boolean; onAnswer?: (text: string) => void }) {
+  // An ask turn is the card: hide format-talk, closing reports, and a
+  // second fence the model echoed in the same message.
+  if (hasAskBlock(text)) {
+    const questions = firstAsk(text)
+    if (questions) {
+      return (
+        <div className={`rich-text${live ? ' rich-text--live' : ''}`}>
+          <AskCard questions={questions} onAnswer={onAnswer} />
+        </div>
+      )
+    }
+    if (live) {
+      return (
+        <div className={`rich-text${live ? ' rich-text--live' : ''}`}>
+          <div className="ask-card ask-card--pending" aria-busy="true">Asking…</div>
+        </div>
+      )
+    }
+  }
   const segments = splitFencedBlocks(text, live)
   return (
     <div className={`rich-text${live ? ' rich-text--live' : ''}`}>
       {segments.map((segment, index) => (
         segment.type === 'code'
-          ? <CodeBlock key={index} code={segment.text} language={segment.language} />
+          ? <MaybeAskBlock key={index} code={segment.text} language={segment.language} onAnswer={onAnswer} />
           : <MarkdownBlocks key={index} text={segment.text} />
       ))}
     </div>
   )
 })
+
+/** An ```ask fence renders as pickable options; anything else, as code. */
+function MaybeAskBlock({ code, language, onAnswer }: { code: string; language?: string; onAnswer?: (text: string) => void }) {
+  const questions = language === 'ask' ? parseAsk(code) : null
+  if (!questions) return <CodeBlock code={code} language={language} />
+  return <AskCard questions={questions} onAnswer={onAnswer} />
+}
 
 function CodeBlock({ code, language }: { code: string; language?: string }) {
   return (

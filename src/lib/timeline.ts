@@ -377,6 +377,18 @@ export class Timeline {
         windowStart = index + 1;
       }
     }
+    // Between the last agent_end and the live turn sit pre-run bookkeeping
+    // events (__status, trailing state, command responses) that the carried
+    // log keeps. The run itself begins at its agent_start — start there, or
+    // every adopted mid-run reload would read as a torn buffer and refuse
+    // to replay.
+    let lastStart = -1;
+    for (let index = windowStart; index < agentEntries.length; index += 1) {
+      if (String(agentEntries[index]?.payload?.type ?? "") === "agent_start") {
+        lastStart = index;
+      }
+    }
+    if (lastStart >= windowStart) windowStart = lastStart;
     const window = agentEntries.slice(windowStart);
     // The run completed before the log was fetched: its messages are in the
     // session file now, so the caller re-reads them instead of replaying.
@@ -716,11 +728,66 @@ export class Timeline {
     });
   }
 
+  /**
+   * Bring the transcript back to a consistent resting state.
+   *
+   * Everything here exists because a turn can end without the events that
+   * normally close it out: a tool whose tool_execution_end was lost when the
+   * stream dropped keeps its "running … esc to interrupt" pill, a text block
+   * whose terminating chunk never arrived keeps `live: true` (seen on the
+   * Claude backend, which hides the model tag and locks the reply's ask card),
+   * and `isStreaming` left true from markPendingRun keeps the composer
+   * spinning. None of those can still be true once the agent is at rest.
+   */
+  private settle() {
+    if (this.state) this.state = { ...this.state, isStreaming: false };
+    this.updateItems((current) =>
+      current.some(
+        (item) =>
+          (item.kind === "tool" && item.status === "running") ||
+          ((item.kind === "assistant" || item.kind === "rationale") &&
+            item.live),
+      )
+        ? current.map((item) => {
+            if (item.kind === "tool" && item.status === "running")
+              return {
+                ...item,
+                status: "error" as const,
+                output:
+                  item.output ||
+                  "(interrupted — result lost when the backend stream dropped)",
+                elapsed: Date.now() - item.startedAt,
+              };
+            if (
+              (item.kind === "assistant" || item.kind === "rationale") &&
+              item.live
+            )
+              return { ...item, live: false };
+            return item;
+          })
+        : current,
+    );
+  }
+
   handle(event: AgentEvent) {
     this.appendBackendEvent(event);
     if (event.type === "__status") {
-      this.status = (event.status as RunStatus) ?? "ready";
+      const status = (event.status as RunStatus) ?? "ready";
+      this.status = status;
       if (event.error) this.appendNotice(String(event.error), "error");
+      // A backend that stopped or errored is not going to answer. Without
+      // this the composer spins forever on a dead process: __status set the
+      // status but left isStreaming true from markPendingRun, and a clean
+      // exit carries no error, so the turn failed in total silence.
+      if (status === "stopped" || status === "error") {
+        const wasRunning = this.state?.isStreaming === true;
+        this.settle();
+        if (wasRunning && !event.error)
+          this.appendNotice(
+            "The backend stopped before answering. Send the message again to restart it.",
+            "error",
+          );
+      }
       this.notify();
       return;
     }
@@ -919,29 +986,7 @@ export class Timeline {
 
     if (event.type === "agent_settled") {
       this.status = "ready";
-      if (this.state) this.state = { ...this.state, isStreaming: false };
-      // A settled agent has no live tools. If the SSE stream dropped while a
-      // tool was running (e.g. the backend restarted mid-command), the
-      // tool_execution_end was lost — reconcile instead of showing the
-      // "running … esc to interrupt" pill forever.
-      this.updateItems((current) =>
-        current.some(
-          (item) => item.kind === "tool" && item.status === "running",
-        )
-          ? current.map((item) =>
-              item.kind === "tool" && item.status === "running"
-                ? {
-                    ...item,
-                    status: "error" as const,
-                    output:
-                      item.output ||
-                      "(interrupted — result lost when the backend stream dropped)",
-                    elapsed: Date.now() - item.startedAt,
-                  }
-                : item,
-            )
-          : current,
-      );
+      this.settle();
       this.notify();
       return;
     }

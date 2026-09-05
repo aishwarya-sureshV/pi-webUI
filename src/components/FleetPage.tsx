@@ -18,25 +18,23 @@ export function FleetPage({
 }) {
   const { tabs, workingKeys, awaitingKeys, activeKey } = useStore();
 
-  const rank = (tab: ConversationTab) =>
-    awaitingKeys.has(tab.key) ? 0 : workingKeys.has(tab.key) ? 1 : 2;
-  const ordered = [...tabs].sort((left, right) => rank(left) - rank(right));
+  // Only sessions parked on an answer. A board that also listed working and
+  // idle runs was just the sidebar again — the one thing it can tell you is
+  // which run stopped for you, and that only reads if nothing else is on it.
+  const ordered = tabs.filter((tab: ConversationTab) => awaitingKeys.has(tab.key));
 
   return (
     <div className="resource-page">
       <header className="resource-page__header">
         <div>
           <h1>Fleet</h1>
-          <p>
-            Every conversation you have open, with the ones that want attention
-            first.
-          </p>
+          <p>Conversations that stopped and are waiting on your answer.</p>
         </div>
       </header>
       <div className="resource-page__content">
         {ordered.length === 0 ? (
           <div className="resource-page__empty">
-            No conversations are open yet.
+            Nothing is waiting on you.
           </div>
         ) : (
           <div className="fleet-grid">

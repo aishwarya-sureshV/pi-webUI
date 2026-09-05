@@ -47,6 +47,7 @@ import {
 } from "../lib/sessionMetrics";
 import { exportFilename, timelineToMarkdown } from "../lib/exportSession";
 import type { TimelineItem } from "../lib/timeline";
+import { hasAskBlock } from "../lib/askBlock";
 import { ToolCard } from "./ToolCard";
 import { RichText } from "./RichText";
 import {
@@ -87,6 +88,7 @@ import {
   IconPencil,
   IconPlus,
   IconStop,
+  IconTerminal,
   IconUpload,
   FishLogo,
 } from "./icons";
@@ -182,18 +184,24 @@ function fileAsBase64(file: File): Promise<string> {
 
 export function Conversation({
   tab,
+  showThinking = false,
   split = false,
   paneIndex = 0,
   paneCount = 1,
   onClose,
   onSessionSplit,
+  terminalOpen = false,
+  onTerminalToggle,
 }: {
   tab: ConversationTab;
+  showThinking?: boolean;
   split?: boolean;
   paneIndex?: number;
   paneCount?: number;
   onClose?: () => void;
   onSessionSplit?: (key: string) => void;
+  terminalOpen?: boolean;
+  onTerminalToggle?: () => void;
 }) {
   const timeline = useTimeline(tab.timeline)!;
   const {
@@ -359,12 +367,22 @@ export function Conversation({
     siblings.push(item);
     subagentChildren.set(item.parentToolUseId, siblings);
   }
-  const visibleItems = timeline.items.filter(
-    (item) =>
-      item.kind !== "rationale" &&
-      !(item.kind === "tool" && item.parentToolUseId) &&
-      !(item.kind === "user" && isLocalCommandText(item.text)),
-  );
+  const visibleItems = timeline.items
+    .filter(
+      (item) =>
+        (showThinking || item.kind !== "rationale") &&
+        !(item.kind === "tool" && item.parentToolUseId) &&
+        !(item.kind === "user" && isLocalCommandText(item.text)),
+    )
+    .filter((item, index, all) => {
+      if (item.kind !== "assistant" || !hasAskBlock(item.text)) return true;
+      for (let i = index - 1; i >= 0; i--) {
+        const prev = all[i]!;
+        if (prev.kind === "user" || prev.kind === "tool") return true;
+        if (prev.kind === "assistant" && hasAskBlock(prev.text)) return false;
+      }
+      return true;
+    });
   const liveNarration = visibleItems.at(-1);
   const showingLiveText = Boolean(
     liveNarration && liveNarration.kind === "assistant" && liveNarration.live,
@@ -385,6 +403,7 @@ export function Conversation({
       _item: Extract<TimelineItem, { kind: "user" }>,
       _index: number,
     ): void => {},
+    onAnswer: (_text: string): void => {},
   });
   rowHandlersRef.current = {
     onFork: (item) => void forkOutput(item),
@@ -414,6 +433,7 @@ export function Conversation({
     },
     onVersionChange: (messageItem, index) =>
       void selectUserVersion(messageItem, index),
+    onAnswer: (text) => void send(text),
   };
   const stableRowHandlers = useMemo(
     () => ({
@@ -432,6 +452,7 @@ export function Conversation({
         dryRun: boolean,
       ): Promise<RewindFilesResult> =>
         rowHandlersRef.current.onRewindFiles(timestamp, dryRun),
+      onAnswer: (text: string): void => rowHandlersRef.current.onAnswer(text),
     }),
     [],
   );
@@ -440,11 +461,13 @@ export function Conversation({
   // the most recent completed assistant response, and only once the whole
   // turn has settled: mid-execution the last completed block is just an
   // intermediate step, so tagging it reads like every block is tagged.
+  // `streaming` already means the turn is over, so item.live must not be
+  // consulted here: a final text block whose terminating chunk never arrived
+  // stays live: true forever (seen on the Claude backend), and filtering on it
+  // dropped the tag — and locked the reply's ask card — on a settled turn.
   const lastAssistantId = streaming
     ? undefined
-    : [...visibleItems]
-        .reverse()
-        .find((item) => item.kind === "assistant" && !item.live)?.id;
+    : lastAnswerableAssistantId(visibleItems);
   const runningShell = streaming
     ? [...timeline.items]
         .reverse()
@@ -1284,9 +1307,9 @@ export function Conversation({
     const steerNow = steerOnceRef.current || midTurnMode === "steer";
     steerOnceRef.current = false;
     const result = streaming
-      ? tab.backend === "claude" && !steerNow
-        ? await api.enqueue(tab.key, outboundMessage, images)
-        : await api.steer(tab.key, outboundMessage, images)
+      ? steerNow || tab.backend === "grok"
+        ? await api.steer(tab.key, outboundMessage, images)
+        : await api.enqueue(tab.key, outboundMessage, images)
       : await api.prompt(tab.key, outboundMessage, promptOptions);
     if (!result.ok) {
       setAttachments(pickedAttachments);
@@ -1677,6 +1700,18 @@ export function Conversation({
 
   const composer = (
     <div className="composer">
+      {!streaming && hasItems && tab.cwd && (
+        <ChangesPanel
+          sessionKey={tab.key}
+          cwd={tab.cwd}
+          streaming={streaming}
+          onAskAgent={(prompt) =>
+            setDraft((current) =>
+              current.trim() ? `${current}\n\n${prompt}` : prompt,
+            )
+          }
+        />
+      )}
       {!hasItems && setupChips}
       {hasItems && (
         <WorkspacePicker
@@ -1746,8 +1781,8 @@ export function Conversation({
       {queued.length > 0 && (
         <div className="queue-strip" aria-label="Queued messages">
           <p className="queue-strip__hint">
-            Waiting for this turn to finish — ⌘/Ctrl+Enter sends into the running
-            turn instead.
+            Waiting for this turn to finish — ⌘/Ctrl+Enter sends into the
+            running turn instead.
           </p>
           {queued.map((item, index) => (
             <div key={item.id} className="queue-chip">
@@ -2119,27 +2154,7 @@ export function Conversation({
       <>
         {split && (
           <div className="conversation-header conversation-header--empty">
-            <div
-              className="conversation-header__hover-strip"
-              aria-hidden="true"
-            />
-            <div className="conversation-header__top">
-              <div
-                className="conversation-header__identity"
-                title={`${displayTitle}\n${tab.cwd}`}
-              >
-                <span className="conversation-header__pane-label">
-                  Session {paneIndex + 1} of {paneCount}
-                </span>
-                <div className="conversation-header__title">{displayTitle}</div>
-                <div className="conversation-header__path">{tab.cwd}</div>
-              </div>
-              <span
-                className={`conversation-header__backend is-${tab.backend}`}
-              >
-                {backendLabel(tab.backend)}
-              </span>
-              <div className="conversation-header__spacer" />
+            <div className="conversation-header__actions">
               <button
                 type="button"
                 className={`conversation-header__download conversation-header__icon-btn${workspaceOpen ? " is-active" : ""}`}
@@ -2195,54 +2210,16 @@ export function Conversation({
   return (
     <>
       <div className="conversation-header">
-        <div className="conversation-header__hover-strip" aria-hidden="true" />
-        <div className="conversation-header__top">
-          <div
-            className="conversation-header__identity"
-            title={`${displayTitle}\n${tab.cwd}`}
-          >
-            {split && (
-              <span className="conversation-header__pane-label">
-                Session {paneIndex + 1} of {paneCount}
-              </span>
-            )}
-            <div className="conversation-header__title">{displayTitle}</div>
-            {split && (
-              <div className="conversation-header__path">{tab.cwd}</div>
-            )}
-          </div>
-          {split && (
-            <span className={`conversation-header__backend is-${tab.backend}`}>
-              {backendLabel(tab.backend)}
-            </span>
-          )}
-          {agentMode === "plan" && (
-            <div className="conversation-header__mode">
-              <IconCube size={13} /> Plan mode
-            </div>
-          )}
-          {status === "working" && (
-            <div className="conversation-header__status">Working</div>
-          )}
-          <div className="conversation-header__spacer" />
-          {onClose && (
-            <button
-              type="button"
-              className="conversation-header__close"
-              aria-label={`Close ${displayTitle}`}
-              title="Close session"
-              onClick={onClose}
-            >
-              ×
-            </button>
-          )}
-        </div>
-        <ContextFill context={context} />
         <div
           className="conversation-header__tabs"
           role="tablist"
           aria-label="Conversation view"
         >
+          {agentMode === "plan" && (
+            <div className="conversation-header__mode">
+              <IconCube size={13} /> Plan mode
+            </div>
+          )}
           <button
             type="button"
             role="tab"
@@ -2272,6 +2249,29 @@ export function Conversation({
           </button>
           <div className="conversation-header__tabs-actions">
             <DeployButton />
+            {onClose && (
+              <button
+                type="button"
+                className="conversation-header__close"
+                aria-label={`Close ${displayTitle}`}
+                title="Close session"
+                onClick={onClose}
+              >
+                ×
+              </button>
+            )}
+            {onTerminalToggle && (
+              <button
+                type="button"
+                className={`conversation-header__download conversation-header__icon-btn${terminalOpen ? " is-active" : ""}`}
+                aria-pressed={terminalOpen}
+                aria-label="Terminal"
+                title="Terminal"
+                onClick={onTerminalToggle}
+              >
+                <IconTerminal size={14} />
+              </button>
+            )}
             <button
               type="button"
               className={`conversation-header__download conversation-header__icon-btn${workspaceOpen ? " is-active" : ""}`}
@@ -2293,7 +2293,7 @@ export function Conversation({
             </button>
           </div>
         </div>
-        {streaming && <div className="activity-line" aria-hidden="true" />}
+        <ContextFill context={context} />
       </div>
 
       <div className="conversation-stage">
@@ -2326,6 +2326,11 @@ export function Conversation({
                       forking={forkingId === row.item.id}
                       showActions={responseActionIds.has(row.item.id)}
                       showModelTag={row.item.id === lastAssistantId}
+                      onAnswer={
+                        row.item.id === lastAssistantId
+                          ? stableRowHandlers.onAnswer
+                          : undefined
+                      }
                       editingId={editingMessageId}
                       streaming={streaming}
                       onEditMessage={stableRowHandlers.onEditMessage}
@@ -2335,18 +2340,6 @@ export function Conversation({
                   ),
                 )}
                 {!streaming && <TodoTranscript tasks={todos} />}
-                {!streaming && hasItems && tab.cwd && (
-                  <ChangesPanel
-                    sessionKey={tab.key}
-                    cwd={tab.cwd}
-                    streaming={streaming}
-                    onAskAgent={(prompt) =>
-                      setDraft((current) =>
-                        current.trim() ? `${current}\n\n${prompt}` : prompt,
-                      )
-                    }
-                  />
-                )}
                 {streaming && runningShell ? (
                   <ActiveRunIndicator
                     item={runningShell}
@@ -2536,9 +2529,9 @@ function RewindFilesButton({
           <>
             <span className="rewind__summary">
               Restore {count} file{count === 1 ? "" : "s"}
-              {preview.insertions !== undefined
-                ? ` (+${preview.insertions}/−${preview.deletions ?? 0})`
-                : ""}
+              {preview.insertions === undefined
+                ? ""
+                : ` (+${preview.insertions}/−${preview.deletions ?? 0})`}
               ?
             </span>
             <button
@@ -2589,6 +2582,7 @@ const TimelineRow = memo(function TimelineRow({
   onCancelEdit,
   onVersionChange,
   onRewindFiles,
+  onAnswer,
   subagentChildren,
 }: {
   item: TimelineItem;
@@ -2609,6 +2603,8 @@ const TimelineRow = memo(function TimelineRow({
     timestamp: number,
     dryRun: boolean,
   ) => Promise<RewindFilesResult>;
+  /** Present only on the newest settled reply — see AskCard. */
+  onAnswer?: (text: string) => void;
   subagentChildren?: Map<string, Extract<TimelineItem, { kind: "tool" }>[]>;
 }) {
   if (item.kind === "tool")
@@ -2705,6 +2701,7 @@ const TimelineRow = memo(function TimelineRow({
             .replace(/\s+$/, "")
             .replace(/^\s+/, "")}
           live={item.live}
+          onAnswer={onAnswer}
         />
       </div>
       {item.kind === "assistant" &&
@@ -2742,6 +2739,17 @@ const TimelineRow = memo(function TimelineRow({
     </article>
   );
 });
+
+/** Newest settled reply, preferring an ask card so a trailing report does not lock it. */
+function lastAnswerableAssistantId(items: TimelineItem[]): string | undefined {
+  const tail: Extract<TimelineItem, { kind: "assistant" }>[] = [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i]!;
+    if (item.kind === "user" || item.kind === "tool") break;
+    if (item.kind === "assistant") tail.push(item);
+  }
+  return (tail.find((item) => hasAskBlock(item.text)) ?? tail[0])?.id;
+}
 
 type ToolItem = Extract<TimelineItem, { kind: "tool" }>;
 type ChatRow =

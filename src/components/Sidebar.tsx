@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useStore } from "../lib/store";
+import { createPortal } from "react-dom";
 import {
   api,
   backendLabel,
@@ -31,6 +32,7 @@ import {
   IconCube,
   IconDots,
   IconExtension,
+  IconFilter,
   IconFolder,
   IconMoon,
   IconNewChat,
@@ -39,7 +41,6 @@ import {
   IconSearch,
   IconSettings,
   IconSun,
-  IconTerminal,
   IconTrash,
   IconColumns,
 } from "./icons";
@@ -56,8 +57,6 @@ export function Sidebar({
   onThemeToggle,
   view,
   onViewChange,
-  terminalOpen,
-  onTerminalToggle,
   splitSessions,
   onSplitSessionsToggle,
   onSessionFocus,
@@ -72,9 +71,6 @@ export function Sidebar({
   onThemeToggle: () => void;
   view: WorkbenchView;
   onViewChange: (view: WorkbenchView) => void;
-  /** Docked terminal pane state — the Terminal nav item toggles the pane. */
-  terminalOpen: boolean;
-  onTerminalToggle: () => void;
   splitSessions: boolean;
   onSplitSessionsToggle: () => void;
   onSessionFocus: (key: string) => void;
@@ -95,6 +91,9 @@ export function Sidebar({
     [],
   );
   const [transcriptSearching, setTranscriptSearching] = useState(false);
+  // Collapsed by default: search and filters open from icons in the header.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [openSessionMenu, setOpenSessionMenu] = useState<string | null>(null);
 
   const [openWorkspaceMenu, setOpenWorkspaceMenu] = useState<string | null>(
@@ -466,13 +465,6 @@ export function Sidebar({
         />
         <SidebarNavButton
           collapsed={collapsed}
-          active={terminalOpen}
-          label="Terminal"
-          onClick={onTerminalToggle}
-          icon={<IconTerminal size={18} />}
-        />
-        <SidebarNavButton
-          collapsed={collapsed}
           active={view === "settings"}
           label="Settings"
           onClick={() => chooseView("settings")}
@@ -554,73 +546,155 @@ export function Sidebar({
 
           <div className="sidebar__saved-head">
             <span className="sidebar__heading">Sessions</span>
-            <label className="sidebar__saved-select">
-              <span className="sr-only">Saved session view</span>
-              <select
-                aria-label="Saved session view"
-                value={sessionView}
-                onChange={(event) => {
-                  setSessionView(event.target.value as "recent" | "archived");
-                  setOpenSessionMenu(null);
+            <div className="sidebar__saved-tools">
+              <button
+                type="button"
+                className={`sidebar__tool-btn${searchOpen ? " is-active" : ""}`}
+                aria-label="Search transcripts"
+                aria-expanded={searchOpen}
+                title="Search transcripts"
+                onClick={() => {
+                  setSearchOpen(true);
+                  setFiltersOpen(false);
                 }}
               >
-                <option value="recent">Recent</option>
-                <option value="archived">Archived</option>
-              </select>
-              <IconChevronDown size={12} />
-            </label>
-          </div>
-          <label className="sidebar__search">
-            <IconSearch size={13} />
-            <input
-              type="search"
-              aria-label="Search session transcripts"
-              placeholder="Search transcripts"
-              value={transcriptQuery}
-              onChange={(event) => setTranscriptQuery(event.target.value)}
-            />
-          </label>
-          {transcriptQuery.trim().length >= 2 && (
-            <div className="sidebar__search-results">
-              {transcriptSearching && (
-                <p className="sidebar__search-note">Searching…</p>
-              )}
-              {!transcriptSearching && transcriptHits.length === 0 && (
-                <p className="sidebar__search-note">No transcripts match.</p>
-              )}
-              {transcriptHits.map((hit) => (
-                <button
-                  key={hit.path}
-                  type="button"
-                  className="sidebar__search-hit"
-                  onClick={() => openSearchHit(hit)}
-                >
-                  <strong>{hit.name || "Untitled session"}</strong>
-                  {hit.snippets.slice(0, 2).map((snippet, index) => (
-                    <span key={index}>
-                      <em>{snippet.role}</em> {snippet.text}
-                    </span>
-                  ))}
-                </button>
-              ))}
+                <IconSearch size={13} />
+              </button>
+              <button
+                type="button"
+                className={`sidebar__tool-btn${
+                  filtersOpen || modelFilter || sessionView !== "recent"
+                    ? " is-active"
+                    : ""
+                }`}
+                aria-label="Session filters"
+                aria-expanded={filtersOpen}
+                title="Filters"
+                onClick={() => setFiltersOpen((open) => !open)}
+              >
+                <IconFilter size={13} />
+              </button>
             </div>
+          </div>
+          {searchOpen &&
+            createPortal(
+              <div
+                className="sidebar__search-modal"
+                role="dialog"
+                aria-label="Search transcripts"
+                onClick={() => setSearchOpen(false)}
+              >
+                <div
+                  className="sidebar__search-panel"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="sidebar__search-bar">
+                    <IconSearch size={14} />
+                    <input
+                      autoFocus
+                      type="search"
+                      aria-label="Search session transcripts"
+                      placeholder="Search transcripts"
+                      value={transcriptQuery}
+                      onChange={(event) =>
+                        setTranscriptQuery(event.target.value)
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="sidebar__search-close"
+                      aria-label="Close search"
+                      onClick={() => {
+                        setSearchOpen(false);
+                        setTranscriptQuery("");
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="sidebar__search-results">
+                    {transcriptSearching && (
+                      <p className="sidebar__search-note">Searching…</p>
+                    )}
+                    {!transcriptSearching &&
+                      transcriptQuery.trim().length >= 2 &&
+                      transcriptHits.length === 0 && (
+                        <p className="sidebar__search-note">
+                          No transcripts match.
+                        </p>
+                      )}
+                    {transcriptQuery.trim().length < 2 && (
+                      <p className="sidebar__search-note">
+                        Type at least 2 characters to search transcripts.
+                      </p>
+                    )}
+                    {transcriptHits.map((hit) => (
+                      <button
+                        key={hit.path}
+                        type="button"
+                        className="sidebar__search-hit"
+                        onClick={() => {
+                          openSearchHit(hit);
+                          setSearchOpen(false);
+                          setTranscriptQuery("");
+                        }}
+                      >
+                        <strong>{hit.name || "Untitled session"}</strong>
+                        {hit.snippets.slice(0, 2).map((snippet, index) => (
+                          <span key={index}>
+                            <em>{snippet.role}</em> {snippet.text}
+                          </span>
+                        ))}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>,
+              document.body,
+            )}
+          {filtersOpen && (
+            <>
+              <div
+                className="sidebar__backdrop"
+                onClick={() => setFiltersOpen(false)}
+              />
+              <div className="sidebar__filters">
+                <label className="sidebar__saved-select">
+                  <span className="sr-only">Saved session view</span>
+                  <select
+                    aria-label="Saved session view"
+                    value={sessionView}
+                    onChange={(event) => {
+                      setSessionView(
+                        event.target.value as "recent" | "archived",
+                      );
+                      setOpenSessionMenu(null);
+                    }}
+                  >
+                    <option value="recent">Recent</option>
+                    <option value="archived">Archived</option>
+                  </select>
+                  <IconChevronDown size={12} />
+                </label>
+                <label className="sidebar__saved-select sidebar__saved-select--model">
+                  <span className="sr-only">Filter sessions by model</span>
+                  <select
+                    aria-label="Filter sessions by model"
+                    value={modelFilter}
+                    onChange={(event) => chooseModelFilter(event.target.value)}
+                  >
+                    <option value="">All models</option>
+                    {modelOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <IconChevronDown size={12} />
+                </label>
+              </div>
+            </>
           )}
-          <label className="sidebar__saved-select sidebar__saved-select--model">
-            <span className="sr-only">Filter sessions by model</span>
-            <select
-              aria-label="Filter sessions by model"
-              value={modelFilter}
-              onChange={(event) => chooseModelFilter(event.target.value)}
-            >
-              <option value="">All models</option>
-              {modelOptions.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <IconChevronDown size={12} />
-          </label>
 
           {workspaceGroups.map((group) => {
             const groupCollapsed =

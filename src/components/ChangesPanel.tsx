@@ -125,16 +125,8 @@ export function ChangesPanel({
 }) {
   const [data, setData] = useState<GitChangesResponse | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  // Collapsed by default: the card stays a single header line until expanded.
-  // Choice persists so reloads/turns don't keep surprising the user with an
-  // always-open box.
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem("pi-web.changes-collapsed") !== "0";
-    } catch {
-      return true;
-    }
-  });
+  // Always collapsed: the card stays a one-line pill until clicked.
+  const [collapsed, setCollapsed] = useState(true);
   const toggleCollapsed = useCallback(() => {
     setCollapsed((current) => {
       const next = !current;
@@ -394,6 +386,9 @@ export function ChangesPanel({
   };
 
   const changes = data?.changes ?? [];
+  // Pill diffstat: the whole turn's additions/deletions, GitHub style.
+  const totalAdd = changes.reduce((sum, change) => sum + change.additions, 0);
+  const totalDel = changes.reduce((sum, change) => sum + change.deletions, 0);
   const stashes = data?.stashes ?? [];
   const branches = data?.branches ?? [];
   const ahead = data?.ahead ?? 0;
@@ -422,7 +417,11 @@ export function ChangesPanel({
   };
 
   const gitMenu = (
-    <div className="changes__menu-wrap" ref={menuRef}>
+    <div
+      className="changes__menu-wrap"
+      ref={menuRef}
+      onClick={(event) => event.stopPropagation()}
+    >
       <button
         type="button"
         className="changes__git"
@@ -769,6 +768,12 @@ export function ChangesPanel({
     );
   }
 
+  // Clicking anywhere on the pill (except a real control) toggles the card.
+  const headerClick = (event: React.MouseEvent) => {
+    if ((event.target as HTMLElement).closest("button, input")) return;
+    toggleCollapsed();
+  };
+
   return (
     <section
       className={`changes${inProgress ? " changes--conflict" : ""}${
@@ -776,26 +781,46 @@ export function ChangesPanel({
       }`}
       aria-label="Code changes"
     >
-      <header className="changes__head">
-        <strong>Changes</strong>
-        <span className="changes__meta">
-          {data.branch}
-          {ahead > 0 && ` ↑${ahead}`}
-          {behind > 0 && ` ↓${behind}`} · {changes.length} file
-          {changes.length === 1 ? "" : "s"}
-          {stashes.length > 0 && ` · ${stashes.length} stashed`}
-        </span>
-        {gitMenu}
+      <header className="changes__head" onClick={headerClick}>
         <button
           type="button"
-          className="changes__collapse"
+          className="changes__pill"
           aria-expanded={!collapsed}
-          aria-label={collapsed ? "Expand changes" : "Collapse changes"}
-          title={collapsed ? "Expand changes" : "Collapse changes"}
           onClick={toggleCollapsed}
         >
-          <IconChevronDown size={14} />
+          <strong>Changes</strong>
+          <span className="changes__meta">
+            {data.branch}
+            {ahead > 0 && ` ↑${ahead}`}
+            {behind > 0 && ` ↓${behind}`} · {changes.length} file
+            {changes.length === 1 ? "" : "s"}
+            {stashes.length > 0 && ` · ${stashes.length} stashed`}
+          </span>
+          <span className="changes__diffstat">
+            <b>+{totalAdd.toLocaleString()}</b>
+            <i>−{totalDel.toLocaleString()}</i>
+          </span>
+          <span
+            className={`changes__pill-chevron${collapsed ? " is-closed" : ""}`}
+            aria-hidden
+          >
+            <IconChevronDown size={14} />
+          </span>
         </button>
+        {/* Git actions only matter on the expanded card. */}
+        {!collapsed && gitMenu}
+        {!collapsed && (
+          <button
+            type="button"
+            className="changes__collapse"
+            aria-expanded={!collapsed}
+            aria-label="Collapse changes"
+            title="Collapse changes"
+            onClick={toggleCollapsed}
+          >
+            <IconChevronDown size={14} />
+          </button>
+        )}
         <button
           type="button"
           className="changes__dismiss"

@@ -86,6 +86,11 @@ class PiAgentProcess {
     // First-response watchdog state (see armFirstResponseWatchdog).
     this.awaitingFirstActivity = false;
     this.firstActivityTimer = undefined;
+    // Messages held while a turn is running; delivered as fresh prompts when
+    // the turn settles. Mirrors the claude-agent queue (pi's own follow_up
+    // queue can't cancel a single message or keep an orderable snapshot).
+    this.queuedMessages = [];
+    this.queueSeq = 0;
   }
 
   onEvent(listener) {
@@ -351,8 +356,84 @@ class PiAgentProcess {
     const response = await this.send({ type: "get_state" }, timeoutMs);
     if (response.success === false)
       throw new Error(response.error ?? "get_state failed");
-    this.lastState = response.data;
+    this.lastState = {
+      ...response.data,
+      queuedMessages: this.queueSnapshot(),
+    };
     return this.lastState;
+  }
+
+  /** Snapshot for the UI: what is waiting, in the order it will be sent. */
+  queueSnapshot() {
+    return this.queuedMessages.map(({ id, message, at }) => ({
+      id,
+      message,
+      at,
+    }));
+  }
+
+  emitQueue() {
+    this.emit({
+      type: "queue_updated",
+      sessionKey: this.sessionKey,
+      queued: this.queueSnapshot(),
+    });
+  }
+
+  /** Hold the message until the running turn settles; send now if idle. */
+  enqueue(message, images) {
+    const text = String(message ?? "");
+    if (!text.trim())
+      return Promise.resolve({ ok: false, error: "Empty message" });
+    if (!this.process)
+      return this.prompt(text, images).then((result) =>
+        result.ok ? { ok: true, data: { queued: false } } : result,
+      );
+    this.queueSeq += 1;
+    this.queuedMessages.push({
+      id: `q-${Date.now()}-${this.queueSeq}`,
+      message: text,
+      images: Array.isArray(images) ? images : [],
+      at: Date.now(),
+    });
+    this.emitQueue();
+    return Promise.resolve({
+      ok: true,
+      data: { queued: true, position: this.queuedMessages.length },
+    });
+  }
+
+  /** Drop one waiting message, or all of them when no id is given. */
+  cancelQueued(id) {
+    const before = this.queuedMessages.length;
+    this.queuedMessages = id
+      ? this.queuedMessages.filter((entry) => entry.id !== id)
+      : [];
+    if (this.queuedMessages.length === before)
+      return { ok: false, error: "That message is no longer queued" };
+    this.emitQueue();
+    return {
+      ok: true,
+      data: { cancelled: before - this.queuedMessages.length },
+    };
+  }
+
+  /** Called when the turn settles: send the next waiting message, if any. */
+  sendNextQueued() {
+    const next = this.queuedMessages.shift();
+    if (!next) return;
+    this.emitQueue();
+    this.prompt(next.message, next.images.length ? next.images : undefined)
+      .then((result) => {
+        if (result.ok) return;
+        // Delivery failed: hand it back so the user can retry or cancel.
+        this.queuedMessages.unshift(next);
+        this.emitQueue();
+      })
+      .catch(() => {
+        this.queuedMessages.unshift(next);
+        this.emitQueue();
+      });
   }
 
   async getMessages(timeoutMs) {
@@ -453,7 +534,10 @@ class PiAgentProcess {
       return { ok: false, error: response.error ?? "failed" };
     }
     const data = response.data;
-    const models = Array.isArray(data) ? data : (data?.models ?? []);
+    const models = (Array.isArray(data) ? data : (data?.models ?? [])).filter(
+      // pi registers the grok provider too; this UI drives pi, not grok.
+      (model) => !/^grok/i.test(String(model?.provider ?? "")),
+    );
     return { ok: true, models: mergeModelLists(models, ollama) };
   }
 
@@ -754,6 +838,9 @@ class PiAgentProcess {
           this.emit({ type: "state", sessionKey: this.sessionKey, state }),
         )
         .catch(() => {});
+      // Queue only ever queues: the next waiting message starts a fresh
+      // turn here, never mid-run.
+      this.sendNextQueued();
     }
     this.emit({ ...event, sessionKey: this.sessionKey });
   }

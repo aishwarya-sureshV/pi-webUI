@@ -42,6 +42,9 @@ function Frame() {
   const [theme, setTheme] = useState<"light" | "dark">(() =>
     localStorage.getItem("pi-web.theme.v2") === "dark" ? "dark" : "light",
   );
+  const [showThinking, setShowThinking] = useState(
+    () => localStorage.getItem("pi-web.show-thinking") === "on",
+  );
   // Terminal lives in a right-docked pane next to the conversation; the
   // expand button swaps it to a full-width view without unmounting the PTYs.
   const [terminalPane, setTerminalPane] = useState(
@@ -59,6 +62,10 @@ function Frame() {
     document.body.toggleAttribute("data-ds-dark-theme", theme === "dark");
     localStorage.setItem("pi-web.theme.v2", theme);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("pi-web.show-thinking", showThinking ? "on" : "off");
+  }, [showThinking]);
 
   const toggleSidebar = () =>
     setSidebarCollapsed((collapsed) => {
@@ -280,8 +287,6 @@ function Frame() {
         }
         view={view}
         onViewChange={changeView}
-        terminalOpen={terminalPane}
-        onTerminalToggle={toggleTerminalPane}
         splitSessions={splitSessions}
         onSplitSessionsToggle={toggleSplitSessions}
         onSessionFocus={focusSession}
@@ -327,9 +332,12 @@ function Frame() {
                           >
                             <Conversation
                               tab={tab}
+                              showThinking={showThinking}
                               split={visibleTabs.length > 1}
                               paneIndex={Math.max(0, visibleIndex)}
                               paneCount={Math.max(1, visibleTabs.length)}
+                              terminalOpen={terminalPane}
+                              onTerminalToggle={toggleTerminalPane}
                               onClose={
                                 visible && visibleTabs.length > 1
                                   ? () => closeConversation(tab.key)
@@ -363,12 +371,21 @@ function Frame() {
               )}
             </>
           ) : view === "fleet" ? (
-            <FleetPage onFocusSession={focusSession} />
+            <FleetPage
+              onFocusSession={(key) => {
+                // Focusing alone left Fleet on screen, so the card click looked
+                // dead — the session it selected was behind this view.
+                focusSession(key);
+                setView("sessions");
+              }}
+            />
           ) : (
             <WorkbenchPage
               view={view}
               theme={theme}
               onThemeChange={setTheme}
+              showThinking={showThinking}
+              onShowThinkingChange={setShowThinking}
               sessionKey={activeKey}
             />
           )}

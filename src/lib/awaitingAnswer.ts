@@ -1,4 +1,5 @@
 import type { TimelineItem } from "./timeline.ts";
+import { hasAskBlock } from "./askBlock.ts";
 
 /**
  * "This session is waiting on you."
@@ -38,5 +39,7 @@ export function isAwaitingAnswer(
         item.kind === "tool",
     );
   if (!last || last.kind !== "assistant") return false;
-  return textAwaitsAnswer(last.text);
+  // An ask block is the model saying it stopped for an answer, so it counts
+  // even when the rendered card holds no trailing "?".
+  return hasAskBlock(last.text) || textAwaitsAnswer(last.text);
 }

@@ -346,6 +346,24 @@ export function IconSearch({ size = 16 }: { size?: number }) {
   );
 }
 
+export function IconFilter({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={size}
+      height={size}
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.35"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M2.5 3.5h11L9.5 8.4v4.1l-3 1.5V8.4z" />
+    </svg>
+  );
+}
+
 export function IconFolderPlus({ size = 16 }: { size?: number }) {
   return (
     <svg
