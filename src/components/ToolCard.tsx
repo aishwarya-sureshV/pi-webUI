@@ -15,9 +15,22 @@ import { NumberedCode } from '../lib/highlight'
 
 type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
 
-export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (view: ToolFileView) => void }) {
+export function ToolCard({
+  item,
+  onOpenFile,
+  children = [],
+}: {
+  item: ToolItem
+  onOpenFile: (view: ToolFileView) => void
+  /** Calls a subagent made under this one, when this is a Task-style call. */
+  children?: ToolItem[]
+}) {
   const shownName = displayToolName(item.name)
   const [open, setOpen] = useState(isFileEditTool(item.name))
+  // A subagent's work is collapsed by default: the point of delegating is not
+  // having to watch it, but it must be one click away when it goes wrong.
+  const [childrenOpen, setChildrenOpen] = useState(false)
+  const runningChildren = children.filter((child) => child.status === 'running').length
 
   const summary = summarizeTool(item.name, item.args)
   const diff = getToolDiff(item)
@@ -38,6 +51,12 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
               <span className="diff-stats" aria-label={`${diff.added} added, ${diff.removed} removed`}>
                 <b>+{diff.added}</b>
                 <i>−{diff.removed}</i>
+              </span>
+            )}
+            {children.length > 0 && (
+              <span className="tool__subagents" title={`${children.length} subagent tool calls`}>
+                {children.length} nested
+                {runningChildren > 0 ? ` · ${runningChildren} running` : ''}
               </span>
             )}
             <span className="tool__state">
@@ -70,6 +89,27 @@ export function ToolCard({ item, onOpenFile }: { item: ToolItem; onOpenFile: (vi
               <NumberedCode code={item.output} language={language} />
             ) : (
               <NumberedCode code={JSON.stringify(item.args, null, 2)} language="json" />
+            )}
+          </div>
+        )}
+        {children.length > 0 && (
+          <div className="tool__nested">
+            <button
+              type="button"
+              className="tool__nested-toggle"
+              aria-expanded={childrenOpen}
+              onClick={() => setChildrenOpen((v) => !v)}
+            >
+              <span>{childrenOpen ? '▼' : '▶'}</span>
+              {childrenOpen ? 'Hide' : 'Show'} what the subagent did (
+              {children.length})
+            </button>
+            {childrenOpen && (
+              <div className="tool__nested-list">
+                {children.map((child) => (
+                  <ToolCard key={child.id} item={child} onOpenFile={onOpenFile} />
+                ))}
+              </div>
             )}
           </div>
         )}

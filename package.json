@@ -6,10 +6,11 @@
   "description": "DeepSeek-harness-style web UI for the local pi coding agent (pi --mode rpc)",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:web\"",
-    "dev:server": "node server/index.js",
+    "dev:server": "node scripts/supervise.mjs",
     "dev:web": "vite",
     "build": "vite build",
     "preview": "node server/index.js",
+    "start": "node scripts/supervise.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test server/ src/lib/",
     "check:grok": "node server/grok-selfcheck.js"

@@ -694,30 +694,6 @@
  color: var(--dsw-alias-state-error, #d84a4a);
 }
 
-.sidebar__rail-actions {
- display: flex;
- flex: 1;
- min-height: 0;
- flex-direction: column;
- align-items: flex-start;
- gap: 12px;
-}
-
-.sidebar__rail-actions button {
- display: grid;
- place-items: center;
- width: 36px;
- height: 36px;
- padding: 0;
- border: 0;
- border-radius: 10px;
- background: transparent;
- color: var(--dsw-alias-label-primary);
-}
-.sidebar__rail-actions button:hover {
- background: var(--dsw-alias-interactive-bg-hover);
-}
-
 .sidebar__new {
  flex: none;
  display: flex;
@@ -1360,11 +1336,6 @@
  text-overflow: ellipsis;
  white-space: nowrap;
 }
-.header__meta {
- font-size: 12px;
- color: var(--dsw-alias-label-caption);
- flex: none;
-}
 
 .activity-line {
  position: absolute;
@@ -1405,40 +1376,8 @@
  overflow: hidden;
  transition: none;
 }
-.details__resize {
- position: absolute;
- z-index: 2;
- top: 0;
- bottom: 0;
- left: -4px;
- width: 8px;
- padding: 0;
- border: 0;
- background: transparent;
- cursor: col-resize;
-}
-.details__resize:hover,
-.details__resize:active {
- background: var(--dsw-alias-state-business-primary);
- opacity: 0.45;
-}
 .details[hidden] {
  display: none;
-}
-.details__head {
- padding: 12px 16px;
- font-size: 12px;
- font-weight: 600;
- text-transform: uppercase;
- letter-spacing: 0.08em;
- color: var(--dsw-alias-label-caption);
- border-bottom: 1px solid var(--dsw-alias-border-l1);
-}
-.details__body {
- padding: 12px 16px;
- overflow-y: auto;
- font-size: 12px;
- color: var(--dsw-alias-label-secondary);
 }
 .details__row {
  display: flex;
@@ -1483,17 +1422,70 @@
  border: 0;
 }
 
+/* Floating drawer handle. Desktop keeps the docked sidebar and hides this. */
+.nav-toggle {
+ display: none;
+}
+
 @media (max-width: 760px) {
  .app-frame {
   grid-template-columns: 0 minmax(0, 1fr) 0 !important;
  }
- .sidebar,
  .details,
  .sidebar-resizer {
-  visibility: hidden;
+  display: none;
  }
  .center {
   grid-column: 2;
+ }
+ /* The sidebar leaves the grid and becomes an overlay drawer, so the
+    conversation gets the full width but navigation is still reachable. */
+ .sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 60;
+  width: min(310px, 84vw) !important;
+  max-width: none;
+  transform: translateX(-102%);
+  transition: transform 220ms var(--ds-ease-in-out, ease);
+  box-shadow: 0 0 32px rgba(0, 0, 0, 0.28);
+  padding-top: max(12px, env(safe-area-inset-top));
+ }
+ .app-frame.is-nav-open .sidebar {
+  transform: translateX(0);
+ }
+ .nav-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: rgba(0, 0, 0, 0.42);
+ }
+ .nav-toggle {
+  display: grid;
+  place-items: center;
+  position: fixed;
+  z-index: 61;
+  top: max(10px, env(safe-area-inset-top));
+  left: 10px;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+ }
+ /* Keep the tab strip clear of the floating handle. */
+ .center {
+  padding-top: 4px;
+ }
+}
+
+@media (max-width: 760px) and (prefers-reduced-motion: reduce) {
+ .sidebar {
+  transition: none;
  }
 }
 
@@ -1553,4 +1545,293 @@
  font-size: 10.5px;
  text-overflow: ellipsis;
  white-space: nowrap;
+}
+
+/* Transcript search in the sidebar: full-text across saved sessions. */
+.sidebar__search {
+ display: flex;
+ align-items: center;
+ gap: 6px;
+ margin: 6px 0;
+ padding: 5px 8px;
+ border-radius: 8px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-bg-layer-1);
+ color: var(--dsw-alias-label-secondary);
+}
+.sidebar__search input {
+ flex: 1;
+ min-width: 0;
+ border: 0;
+ background: none;
+ color: var(--dsw-alias-label-primary);
+ font-size: 12px;
+ outline: none;
+}
+.sidebar__search input::-webkit-search-cancel-button {
+ filter: grayscale(1);
+}
+.sidebar__search-results {
+ display: flex;
+ flex-direction: column;
+ gap: 4px;
+ max-height: 320px;
+ overflow-y: auto;
+ margin-bottom: 8px;
+}
+.sidebar__search-note {
+ margin: 4px 2px;
+ font-size: 11.5px;
+ color: var(--dsw-alias-label-caption);
+}
+.sidebar__search-hit {
+ display: flex;
+ flex-direction: column;
+ gap: 3px;
+ width: 100%;
+ padding: 7px 8px;
+ border-radius: 8px;
+ border: 1px solid transparent;
+ background: var(--dsw-alias-bg-layer-1);
+ color: var(--dsw-alias-label-secondary);
+ text-align: left;
+ font-size: 11.5px;
+ cursor: pointer;
+}
+.sidebar__search-hit:hover {
+ border-color: var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-interactive-bg-hover);
+}
+.sidebar__search-hit strong {
+ color: var(--dsw-alias-label-primary);
+ font-size: 12px;
+ font-weight: 600;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+.sidebar__search-hit span {
+ display: -webkit-box;
+ -webkit-line-clamp: 2;
+ line-clamp: 2;
+ -webkit-box-orient: vertical;
+ overflow: hidden;
+ line-height: 1.45;
+}
+.sidebar__search-hit em {
+ font-style: normal;
+ opacity: 0.65;
+ text-transform: uppercase;
+ font-size: 9.5px;
+ letter-spacing: 0.04em;
+ margin-right: 4px;
+}
+
+/* Agent settings card: hook commands and resolved JSON. */
+.settings-card__hook {
+ display: block;
+ font-family: var(--ds-font-family-code);
+ font-size: 11px;
+ line-height: 1.5;
+ max-height: 5.2em;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ word-break: break-all;
+}
+.settings-card__reveal {
+ align-self: flex-start;
+ margin-top: 4px;
+ padding: 4px 10px;
+ border-radius: 7px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-bg-layer-2);
+ color: var(--dsw-alias-label-primary);
+ font-size: 11.5px;
+ cursor: pointer;
+}
+.settings-card__raw {
+ margin: 6px 0 0;
+ padding: 10px;
+ border-radius: 8px;
+ background: var(--dsw-alias-bg-layer-2);
+ color: var(--dsw-alias-label-secondary);
+ font-family: var(--ds-font-family-code);
+ font-size: 11px;
+ line-height: 1.5;
+ max-height: 320px;
+ overflow: auto;
+ white-space: pre-wrap;
+ word-break: break-word;
+}
+
+/* Skills authoring */
+.skills-view {
+ display: flex;
+ flex-direction: column;
+ gap: 12px;
+}
+.skills-view__bar {
+ display: flex;
+ align-items: center;
+ gap: 10px;
+}
+.skills-view__new {
+ padding: 6px 12px;
+ border-radius: 8px;
+ border: 1px solid var(--pw-accent-line);
+ background: var(--dsw-alias-bg-layer-1);
+ color: var(--pw-accent);
+ font-size: 12.5px;
+ cursor: pointer;
+}
+.skills-view__error {
+ color: var(--ds-status-error);
+ font-size: 12px;
+}
+.skills-view__field {
+ display: flex;
+ flex-direction: column;
+ gap: 4px;
+ margin-top: 10px;
+}
+.skills-view__field span {
+ font-size: 11.5px;
+ color: var(--dsw-alias-label-secondary);
+}
+.skills-view__field input,
+.skills-view__field textarea {
+ padding: 7px 9px;
+ border-radius: 8px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-bg-layer-2);
+ color: var(--dsw-alias-label-primary);
+ font-size: 12.5px;
+ font-family: inherit;
+ resize: vertical;
+}
+.skills-view__field textarea {
+ font-family: var(--ds-font-family-code);
+ line-height: 1.55;
+}
+.skills-view__actions {
+ display: flex;
+ gap: 8px;
+ margin-top: 12px;
+}
+.skills-view__actions button,
+.skills-view__row-actions button {
+ padding: 5px 11px;
+ border-radius: 7px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ background: var(--dsw-alias-bg-layer-2);
+ color: var(--dsw-alias-label-primary);
+ font-size: 12px;
+ cursor: pointer;
+}
+.skills-view__actions button:disabled,
+.skills-view__row-actions button:disabled {
+ opacity: 0.5;
+ cursor: default;
+}
+.skills-view__row-actions {
+ display: flex;
+ gap: 6px;
+ margin-top: 8px;
+}
+.skills-view__row-actions button:last-child:hover:not(:disabled) {
+ border-color: rgba(248, 113, 113, 0.45);
+ color: var(--ds-status-error);
+}
+
+/* Fleet board: one card per open conversation. */
+.fleet-grid {
+ display: grid;
+ grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+ gap: 12px;
+}
+.fleet-card {
+ display: flex;
+ flex-direction: column;
+ gap: 8px;
+ padding: 13px;
+ border: 1px solid var(--dsw-alias-border-l2);
+ border-radius: 11px;
+ background: var(--dsw-alias-bg-layer-1);
+ text-align: left;
+ cursor: pointer;
+ transition: border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+.fleet-card:hover {
+ border-color: var(--dsw-alias-border-l3);
+}
+.fleet-card.is-active {
+ border-color: var(--pw-accent-line);
+}
+.fleet-card--awaiting {
+ border-color: var(--pw-accent-line);
+}
+.fleet-card__head {
+ display: flex;
+ align-items: center;
+ gap: 7px;
+ min-width: 0;
+}
+.fleet-card__head strong {
+ flex: 1;
+ min-width: 0;
+ color: var(--dsw-alias-label-primary);
+ font-size: 13px;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+.fleet-card__head em {
+ flex: none;
+ font-style: normal;
+ font-size: 10.5px;
+ color: var(--dsw-alias-label-caption);
+}
+.fleet-card__dot {
+ flex: none;
+ width: 7px;
+ height: 7px;
+ border-radius: 999px;
+ background: var(--dsw-alias-border-l3);
+}
+.fleet-card__dot--working {
+ background: var(--pw-teal, #3aa6a0);
+ animation: fleet-pulse 1.6s ease-in-out infinite;
+}
+.fleet-card__dot--awaiting {
+ background: var(--pw-accent);
+}
+@keyframes fleet-pulse {
+ 0%, 100% { opacity: 1; }
+ 50% { opacity: 0.35; }
+}
+.fleet-card__activity {
+ margin: 0;
+ color: var(--dsw-alias-label-secondary);
+ font-size: 12px;
+ line-height: 1.5;
+ display: -webkit-box;
+ -webkit-line-clamp: 2;
+ line-clamp: 2;
+ -webkit-box-orient: vertical;
+ overflow: hidden;
+}
+.fleet-card__meta {
+ display: flex;
+ flex-wrap: wrap;
+ gap: 4px 10px;
+ color: var(--dsw-alias-label-caption);
+ font-size: 10.5px;
+}
+.fleet-card__meta span {
+ display: inline-flex;
+ align-items: center;
+ gap: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+ .fleet-card__dot--working { animation: none; }
 }

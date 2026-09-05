@@ -57,6 +57,9 @@ export type TimelineItem =
       // ACP tool-call category (e.g. "execute") for backends, like Grok, whose
       // tool names aren't the literal "bash" pi/claude use to flag a live run.
       execKind?: string;
+      // Id of the Task tool call that spawned this one, when a subagent made
+      // it. Absent for the main loop's own calls.
+      parentToolUseId?: string;
     }
   | {
       id: string;
@@ -726,10 +729,8 @@ export class Timeline {
       return;
     }
     if (event.type === "subagent_start") {
-      this.appendNotice(
-        "Subagent started. Its progress will appear inline.",
-        "info",
-      );
+      // No notice: the subagent's calls carry parentToolUseId and render
+      // nested inside the Task card that spawned them.
       return;
     }
     if (
@@ -855,6 +856,10 @@ export class Timeline {
       const args = asRecord(event.args);
       const execKind =
         typeof event.execKind === "string" ? event.execKind : undefined;
+      const parentToolUseId =
+        typeof event.parentToolUseId === "string" && event.parentToolUseId
+          ? event.parentToolUseId
+          : undefined;
       this.updateItems((current) =>
         current.some((item) => item.kind === "tool" && item.id === id)
           ? current
@@ -870,6 +875,7 @@ export class Timeline {
                 status: "running",
                 startedAt: Date.now(),
                 ...(execKind ? { execKind } : {}),
+                ...(parentToolUseId ? { parentToolUseId } : {}),
               },
             ],
       );

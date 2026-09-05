@@ -25,6 +25,7 @@ import {
   type SessionState,
 } from "./api";
 import { Timeline } from "./timeline";
+import { notify } from "./notify";
 import { savedSessionTitle } from "./sessionTitle";
 import { isAwaitingAnswer } from "./awaitingAnswer";
 import {
@@ -232,6 +233,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           else next.delete(key);
           return next;
         });
+        if (event.type === "agent_settled") {
+          notify(
+            "Turn finished",
+            `${timeline?.state?.sessionName || "A session"} is done.`,
+            `done:${key}`,
+          );
+        }
         if (
           event.type === "agent_settled" ||
           event.type === "session_title_set"

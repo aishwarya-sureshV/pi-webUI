@@ -8,7 +8,12 @@ import {
   type ReactNode,
 } from "react";
 import { useStore } from "../lib/store";
-import { backendLabel, type AgentBackend } from "../lib/api";
+import {
+  api,
+  backendLabel,
+  type AgentBackend,
+  type SessionSearchResult,
+} from "../lib/api";
 import type { WorkbenchView } from "../lib/navigation";
 import { formatRelativeTime } from "../lib/time";
 import { savedSessionTitle } from "../lib/sessionTitle";
@@ -31,6 +36,7 @@ import {
   IconNewChat,
   IconPanel,
   IconRestore,
+  IconSearch,
   IconSettings,
   IconSun,
   IconTerminal,
@@ -83,7 +89,14 @@ export function Sidebar({
   const [modelFilter, setModelFilter] = useState(
     () => localStorage.getItem("pi-web.session-model-filter") || "",
   );
+  // Full-text search across saved transcripts, not just their titles.
+  const [transcriptQuery, setTranscriptQuery] = useState("");
+  const [transcriptHits, setTranscriptHits] = useState<SessionSearchResult[]>(
+    [],
+  );
+  const [transcriptSearching, setTranscriptSearching] = useState(false);
   const [openSessionMenu, setOpenSessionMenu] = useState<string | null>(null);
+
   const [openWorkspaceMenu, setOpenWorkspaceMenu] = useState<string | null>(
     null,
   );
@@ -95,6 +108,37 @@ export function Sidebar({
     requestedBackend === "claude" || requestedBackend === "grok"
       ? requestedBackend
       : "pi";
+  // Debounced: reading transcripts is far heavier than filtering titles, so
+  // it waits for a pause in typing rather than firing per keystroke.
+  useEffect(() => {
+    const query = transcriptQuery.trim();
+    if (query.length < 2) {
+      setTranscriptHits([]);
+      setTranscriptSearching(false);
+      return;
+    }
+    let cancelled = false;
+    setTranscriptSearching(true);
+    const timer = window.setTimeout(() => {
+      void api
+        .searchSessions(query, currentBackend)
+        .then((result) => {
+          if (cancelled) return;
+          setTranscriptHits(result.ok ? (result.results ?? []) : []);
+          setTranscriptSearching(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setTranscriptHits([]);
+          setTranscriptSearching(false);
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [transcriptQuery, currentBackend]);
+
   const [sessionMenuOpensUp, setSessionMenuOpensUp] = useState(false);
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<
     ReadonlySet<string>
@@ -273,6 +317,20 @@ export function Sidebar({
     chooseView("sessions");
   };
 
+  const openSearchHit = (hit: SessionSearchResult) => {
+    const key = resumeConversation({
+      path: hit.path,
+      name: hit.name,
+      cwd: hit.cwd,
+      createdAt: hit.modifiedAt,
+      modifiedAt: hit.modifiedAt,
+      messageCount: hit.messageCount,
+      backend: hit.backend,
+    });
+    onSessionFocus(key);
+    chooseView("sessions");
+  };
+
   const focusSavedSession = (session: (typeof savedSessions)[number]) => {
     const key = resumeConversation(session);
     onSessionFocus(key);
@@ -383,6 +441,14 @@ export function Sidebar({
           live={workingKeys.size > 0}
           onClick={() => chooseView("sessions")}
           icon={<IconFolder size={18} />}
+        />
+        <SidebarNavButton
+          collapsed={collapsed}
+          active={view === "fleet"}
+          label="Fleet"
+          live={workingKeys.size > 1}
+          onClick={() => chooseView("fleet")}
+          icon={<IconPanel size={18} />}
         />
         <SidebarNavButton
           collapsed={collapsed}
@@ -504,6 +570,41 @@ export function Sidebar({
               <IconChevronDown size={12} />
             </label>
           </div>
+          <label className="sidebar__search">
+            <IconSearch size={13} />
+            <input
+              type="search"
+              aria-label="Search session transcripts"
+              placeholder="Search transcripts"
+              value={transcriptQuery}
+              onChange={(event) => setTranscriptQuery(event.target.value)}
+            />
+          </label>
+          {transcriptQuery.trim().length >= 2 && (
+            <div className="sidebar__search-results">
+              {transcriptSearching && (
+                <p className="sidebar__search-note">Searching…</p>
+              )}
+              {!transcriptSearching && transcriptHits.length === 0 && (
+                <p className="sidebar__search-note">No transcripts match.</p>
+              )}
+              {transcriptHits.map((hit) => (
+                <button
+                  key={hit.path}
+                  type="button"
+                  className="sidebar__search-hit"
+                  onClick={() => openSearchHit(hit)}
+                >
+                  <strong>{hit.name || "Untitled session"}</strong>
+                  {hit.snippets.slice(0, 2).map((snippet, index) => (
+                    <span key={index}>
+                      <em>{snippet.role}</em> {snippet.text}
+                    </span>
+                  ))}
+                </button>
+              ))}
+            </div>
+          )}
           <label className="sidebar__saved-select sidebar__saved-select--model">
             <span className="sr-only">Filter sessions by model</span>
             <select

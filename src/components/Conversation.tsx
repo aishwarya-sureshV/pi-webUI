@@ -16,10 +16,15 @@ import {
   backendLabel,
   subscribeEvents,
   type ModelInfo,
+  type ContextUsageReport,
+  type QueuedMessage,
+  type WorkspaceMatch,
+  type RewindFilesResult,
   type ProviderUsage,
   type SlashCommand,
 } from "../lib/api";
 import { useStore, useTimeline, type ConversationTab } from "../lib/store";
+import { DeployButton } from "./DeployButton";
 import {
   contextualSessionTitle,
   isLocalCommandText,
@@ -35,7 +40,12 @@ import {
   isModelIdentityQuestion,
   runtimeModelAnswer,
 } from "../lib/modelIdentity";
-import { estimateContext, compactTokens } from "../lib/sessionMetrics";
+import {
+  estimateContext,
+  compactTokens,
+  type ContextUsage,
+} from "../lib/sessionMetrics";
+import { exportFilename, timelineToMarkdown } from "../lib/exportSession";
 import type { TimelineItem } from "../lib/timeline";
 import { ToolCard } from "./ToolCard";
 import { RichText } from "./RichText";
@@ -73,6 +83,7 @@ import {
   IconFolderPlus,
   IconFork,
   IconInfo,
+  IconHistory,
   IconPencil,
   IconPlus,
   IconStop,
@@ -123,6 +134,11 @@ const LOCAL_COMMANDS: SlashCommand[] = [
   {
     name: "diff",
     description: "Review every file change in one diff viewer",
+    source: "local",
+  },
+  {
+    name: "export",
+    description: "Download this conversation as a Markdown transcript",
     source: "local",
   },
   {
@@ -235,6 +251,33 @@ export function Conversation({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [configuring, setConfiguring] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
+  // "@" file picker: the caret position is tracked because a mention is only
+  // the token immediately before the caret, unlike "/" which owns the draft.
+  const [caret, setCaret] = useState(0);
+  const [mentionMatches, setMentionMatches] = useState<WorkspaceMatch[]>([]);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  // Prompts lined up behind the running turn. Server-owned, so a refresh or a
+  // second tab sees the same queue.
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
+  /**
+   * What Enter does while a turn is running. Queueing waits for the turn to
+   * finish; steering pushes the message into the turn that is already going,
+   * which is the only way to redirect work mid-flight. Cmd/Ctrl+Enter always
+   * steers regardless, so the fast path never needs the menu.
+   */
+  const [midTurnMode, setMidTurnMode] = useState<"queue" | "steer">(() =>
+    localStorage.getItem("pi-web.mid-turn") === "steer" ? "steer" : "queue",
+  );
+  const chooseMidTurnMode = (mode: "queue" | "steer") => {
+    setMidTurnMode(mode);
+    try {
+      localStorage.setItem("pi-web.mid-turn", mode);
+    } catch {
+      /* private mode; the choice lasts this session only */
+    }
+  };
+  // Set for one send by Cmd/Ctrl+Enter, then cleared.
+  const steerOnceRef = useRef(false);
   const [conversationView, setConversationView] = useState<
     "chat" | "trajectory" | "backend"
   >("chat");
@@ -265,6 +308,7 @@ export function Conversation({
   const modelMetadataLoadedRef = useRef(tab.backend === "claude");
 
   const state = timeline.state;
+
   const status = timeline.status;
   const streaming = status === "working" || state?.isStreaming === true;
   const firstUserItem = timeline.items.find(
@@ -279,15 +323,46 @@ export function Conversation({
     tab.label,
   );
   const todos = extractTodos(timeline.items, { turnComplete: !streaming });
-  const context = estimateContext(timeline.items, state);
+  // Claude Code can count the context for real; every other backend gets the
+  // character-based estimate. Refreshed between turns, since that is when the
+  // number actually moves and when the CLI is free to answer.
+  const [exactContext, setExactContext] = useState<ContextUsageReport | null>(
+    null,
+  );
+  const estimated = estimateContext(timeline.items, state);
+  const context: ContextUsage = exactContext
+    ? {
+        estimatedTokens: exactContext.totalTokens,
+        contextWindow: exactContext.maxTokens,
+        percent: exactContext.percent,
+        exact: true,
+        autoCompactAt: exactContext.isAutoCompactEnabled
+          ? exactContext.autoCompactThreshold
+          : undefined,
+        categories: exactContext.categories,
+      }
+    : estimated;
   const hasItems = timeline.items.length > 0;
   // Reasoning summaries are intentionally not rendered in the chat view. The
   // data still flows through the timeline (Trajectory tab, context estimates),
   // but the transcript stays clean; thinking activity surfaces as the
   // "is thinking" spinner while the agent streams.
+  // Subagent calls render inside the Task card that spawned them, so they
+  // must not also appear as siblings in the main transcript.
+  const subagentChildren = new Map<
+    string,
+    Extract<TimelineItem, { kind: "tool" }>[]
+  >();
+  for (const item of timeline.items) {
+    if (item.kind !== "tool" || !item.parentToolUseId) continue;
+    const siblings = subagentChildren.get(item.parentToolUseId) ?? [];
+    siblings.push(item);
+    subagentChildren.set(item.parentToolUseId, siblings);
+  }
   const visibleItems = timeline.items.filter(
     (item) =>
       item.kind !== "rationale" &&
+      !(item.kind === "tool" && item.parentToolUseId) &&
       !(item.kind === "user" && isLocalCommandText(item.text)),
   );
   const liveNarration = visibleItems.at(-1);
@@ -300,6 +375,10 @@ export function Conversation({
   // stable while the closures always see the latest state.
   const rowHandlersRef = useRef({
     onFork: (_item: Extract<TimelineItem, { kind: "assistant" }>): void => {},
+    onRewindFiles: async (
+      _timestamp: number,
+      _dryRun: boolean,
+    ): Promise<RewindFilesResult> => ({}),
     onEditMessage: (_item: Extract<TimelineItem, { kind: "user" }>): void => {},
     onCancelEdit: (): void => {},
     onVersionChange: (
@@ -309,6 +388,15 @@ export function Conversation({
   });
   rowHandlersRef.current = {
     onFork: (item) => void forkOutput(item),
+    onRewindFiles: async (timestamp, dryRun) => {
+      const result = await api.rewindFiles(tab.key, timestamp, dryRun, {
+        cwd: tab.cwd,
+        sessionPath: state?.sessionFile,
+      });
+      if (!result.ok)
+        return { error: result.error ?? "The rewind could not be applied." };
+      return result.data ?? {};
+    },
     onEditMessage: (messageItem) => {
       setEditingMessageId(messageItem.id);
       setDraft(
@@ -339,6 +427,11 @@ export function Conversation({
       ): void => rowHandlersRef.current.onVersionChange(messageItem, index),
       onFork: (item: Extract<TimelineItem, { kind: "assistant" }>): void =>
         rowHandlersRef.current.onFork(item),
+      onRewindFiles: (
+        timestamp: number,
+        dryRun: boolean,
+      ): Promise<RewindFilesResult> =>
+        rowHandlersRef.current.onRewindFiles(timestamp, dryRun),
     }),
     [],
   );
@@ -528,6 +621,40 @@ export function Conversation({
     state?.model?.provider,
     status,
   ]);
+
+  useEffect(() => {
+    setQueued(state?.queuedMessages ?? []);
+  }, [state?.queuedMessages]);
+
+  useEffect(
+    () =>
+      subscribeEvents((event) => {
+        if (event.sessionKey !== tab.key || event.type !== "queue_updated")
+          return;
+        setQueued((event.queued as QueuedMessage[]) ?? []);
+      }),
+    [tab.key],
+  );
+
+  useEffect(() => {
+    if (tab.backend !== "claude" || streaming) {
+      if (tab.backend !== "claude") setExactContext(null);
+      return;
+    }
+    let cancelled = false;
+    void api
+      .contextUsage(tab.key)
+      .then((result) => {
+        if (!cancelled)
+          setExactContext(result.ok && result.data ? result.data : null);
+      })
+      .catch(() => {
+        if (!cancelled) setExactContext(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab.key, tab.backend, streaming, timeline.items.length]);
 
   useEffect(
     () =>
@@ -948,6 +1075,29 @@ export function Conversation({
       );
       return;
     }
+    if (message === "/export") {
+      setDraft("");
+      const markdown = timelineToMarkdown(timeline.items, {
+        title: displayTitle,
+        backend: backendLabel(tab.backend),
+        model: state?.model?.name ?? state?.model?.id,
+        cwd: tab.cwd,
+      });
+      const name = exportFilename(displayTitle);
+      const url = URL.createObjectURL(
+        new Blob([markdown], { type: "text/markdown;charset=utf-8" }),
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Revoked on the next tick so the download has taken the handle.
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      timeline.appendNotice(`Exported this conversation to ${name}.`, "info");
+      return;
+    }
     if (message === "/context") {
       setDraft("");
       const userTurns = timeline.items.filter(
@@ -956,9 +1106,17 @@ export function Conversation({
       const toolCalls = timeline.items.filter(
         (item) => item.kind === "tool",
       ).length;
-      const usage = estimateContext(timeline.items, state ?? null);
+      // Prefer the backend's own accounting; fall back to the estimate.
+      const usage = context.exact
+        ? context
+        : estimateContext(timeline.items, state ?? null);
+      const qualifier = usage.exact ? "" : "~";
+      const breakdown = (usage.categories ?? [])
+        .slice(0, 5)
+        .map((entry) => `${entry.name} ${compactTokens(entry.tokens)}`)
+        .join(", ");
       timeline.appendNotice(
-        `Context use: ~${compactTokens(usage.estimatedTokens)} of ${compactTokens(usage.contextWindow)} tokens (${usage.percent}%) — ${userTurns} user turns, ${toolCalls} tool calls, plus the system prompt and tool definitions. /compact squeezes older history before a new phase; /clear starts fresh.`,
+        `Context use: ${qualifier}${compactTokens(usage.estimatedTokens)} of ${compactTokens(usage.contextWindow)} tokens (${usage.percent}%) — ${userTurns} user turns, ${toolCalls} tool calls${breakdown ? `. Largest: ${breakdown}` : ", plus the system prompt and tool definitions"}.${usage.autoCompactAt ? ` Auto-compacts at ${compactTokens(usage.autoCompactAt)}.` : ""} /compact squeezes older history before a new phase; /clear starts fresh.`,
         "info",
       );
       return;
@@ -1120,8 +1278,15 @@ export function Conversation({
       model: state?.model ?? undefined,
       thinkingLevel: state?.thinkingLevel ?? undefined,
     };
+    // Mid-turn, a new prompt waits its turn instead of being spliced into the
+    // running one — and stays cancellable while it waits. Backends without a
+    // queue keep the old steer behaviour.
+    const steerNow = steerOnceRef.current || midTurnMode === "steer";
+    steerOnceRef.current = false;
     const result = streaming
-      ? await api.steer(tab.key, outboundMessage, images)
+      ? tab.backend === "claude" && !steerNow
+        ? await api.enqueue(tab.key, outboundMessage, images)
+        : await api.steer(tab.key, outboundMessage, images)
       : await api.prompt(tab.key, outboundMessage, promptOptions);
     if (!result.ok) {
       setAttachments(pickedAttachments);
@@ -1165,6 +1330,44 @@ export function Conversation({
     ...LOCAL_COMMANDS,
     ...commands.filter((command) => !localByName.has(command.name)),
   ];
+  // The "@" token under the caret, if any: an @ that starts a word, followed
+  // by anything but whitespace.
+  const mentionQuery = (() => {
+    const before = draft.slice(0, caret);
+    const match = /(?:^|\s)@([^\s@]*)$/.exec(before);
+    return match ? match[1] : null;
+  })();
+  const mentionOpen = mentionQuery !== null && mentionMatches.length > 0;
+
+  // Debounced so a fast typist does not walk the tree on every keystroke.
+  // Declared here rather than with the other effects because the dependency
+  // array is evaluated during render and mentionQuery is derived just above.
+  useEffect(() => {
+    if (mentionQuery === null) {
+      setMentionMatches([]);
+      return;
+    }
+    const root = tab.cwd;
+    if (!root) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void api
+        .workspaceSearch(root, mentionQuery)
+        .then((result) => {
+          if (cancelled) return;
+          setMentionMatches(result.ok ? (result.matches ?? []) : []);
+          setMentionIndex(0);
+        })
+        .catch(() => {
+          if (!cancelled) setMentionMatches([]);
+        });
+    }, 120);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [mentionQuery, tab.cwd]);
+
   const bareSlashCommand = /^\/([\w:-]*)$/.exec(draft);
   const slashFilter = bareSlashCommand
     ? bareSlashCommand[1].toLowerCase()
@@ -1178,7 +1381,65 @@ export function Conversation({
   const slashOpen =
     commandMenuOpen || (slashFilter !== null && slashMatches.length > 0);
 
+  /** Swap the "@token" under the caret for the picked path. */
+  const applyMention = (match: WorkspaceMatch) => {
+    const before = draft.slice(0, caret);
+    const start = before.search(/(?:^|\s)@[^\s@]*$/);
+    const at = before.indexOf("@", start === -1 ? 0 : start);
+    if (at === -1) return;
+    const next = `${draft.slice(0, at)}@${match.relativePath} ${draft.slice(caret)}`;
+    setDraft(next);
+    setMentionMatches([]);
+    const caretAfter = at + match.relativePath.length + 2;
+    window.setTimeout(() => {
+      const node = textareaRef.current;
+      if (!node) return;
+      node.focus();
+      node.setSelectionRange(caretAfter, caretAfter);
+      setCaret(caretAfter);
+      autoGrow();
+    }, 0);
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Steer the running turn, whatever the mid-turn default is.
+    if (
+      event.key === "Enter" &&
+      (event.metaKey || event.ctrlKey) &&
+      streaming &&
+      draft.trim()
+    ) {
+      event.preventDefault();
+      steerOnceRef.current = true;
+      void send(draft);
+      return;
+    }
+    if (mentionOpen) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMentionIndex((i) => (i + 1) % mentionMatches.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMentionIndex(
+          (i) => (i - 1 + mentionMatches.length) % mentionMatches.length,
+        );
+        return;
+      }
+      if (event.key === "Tab" || event.key === "Enter") {
+        event.preventDefault();
+        applyMention(
+          mentionMatches[Math.min(mentionIndex, mentionMatches.length - 1)],
+        );
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMentionMatches([]);
+        return;
+      }
+    }
     if (slashOpen && slashMatches.length > 0) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -1442,6 +1703,24 @@ export function Conversation({
           </button>
         </div>
       )}
+      {mentionOpen && (
+        <div className="slash-menu mention-menu">
+          {mentionMatches.map((match, index) => (
+            <button
+              key={match.path}
+              type="button"
+              className={`slash-menu__item${index === mentionIndex ? " is-active" : ""}`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                applyMention(match);
+              }}
+            >
+              <code>{match.name}</code>
+              <span>{match.relativePath}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {slashOpen && slashMatches.length > 0 && (
         <div className="slash-menu">
           {slashMatches.map((command, index) => (
@@ -1464,6 +1743,28 @@ export function Conversation({
         </div>
       )}
       {streaming && todos.length > 0 && <TodoTracker tasks={todos} />}
+      {queued.length > 0 && (
+        <div className="queue-strip" aria-label="Queued messages">
+          <p className="queue-strip__hint">
+            Waiting for this turn to finish — ⌘/Ctrl+Enter sends into the running
+            turn instead.
+          </p>
+          {queued.map((item, index) => (
+            <div key={item.id} className="queue-chip">
+              <span className="queue-chip__index">{index + 1}</span>
+              <span className="queue-chip__text">{item.message}</span>
+              <button
+                type="button"
+                aria-label="Remove from queue"
+                title="Remove from queue"
+                onClick={() => void api.cancelQueued(tab.key, item.id)}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <form
         className="composer__card"
         onSubmit={(e: FormEvent) => {
@@ -1550,9 +1851,13 @@ export function Conversation({
             value={draft}
             onChange={(e) => {
               setDraft(e.target.value);
+              setCaret(e.target.selectionStart ?? e.target.value.length);
               if (commandMenuOpen) setCommandMenuOpen(false);
               autoGrow();
             }}
+            onSelect={(e) =>
+              setCaret((e.target as HTMLTextAreaElement).selectionStart ?? 0)
+            }
             onKeyDown={onKeyDown}
             onPaste={onPasteImage}
           />
@@ -1613,6 +1918,24 @@ export function Conversation({
                 </button>
               </div>
             </details>
+            {streaming && (
+              <div className="native-select native-select--chip native-select--mode">
+                <select
+                  aria-label="What Enter does while the agent is working"
+                  title="Queue waits for this turn to finish. Steer pushes the message into the turn that is already running (⌘/Ctrl+Enter always steers)."
+                  value={midTurnMode}
+                  onChange={(event) =>
+                    chooseMidTurnMode(event.target.value as "queue" | "steer")
+                  }
+                >
+                  <option value="queue">Queue next</option>
+                  <option value="steer">Steer now</option>
+                </select>
+                <span className="native-select__chev">
+                  <IconChevronDown size={13} />
+                </span>
+              </div>
+            )}
             {hasItems && (
               <div className="native-select native-select--chip native-select--mode">
                 <span className="native-select__icon">
@@ -1948,6 +2271,7 @@ export function Conversation({
             Backend log
           </button>
           <div className="conversation-header__tabs-actions">
+            <DeployButton />
             <button
               type="button"
               className={`conversation-header__download conversation-header__icon-btn${workspaceOpen ? " is-active" : ""}`}
@@ -1997,6 +2321,8 @@ export function Conversation({
                       item={row.item}
                       onOpenFile={setViewer}
                       onFork={stableRowHandlers.onFork}
+                      onRewindFiles={stableRowHandlers.onRewindFiles}
+                      subagentChildren={subagentChildren}
                       forking={forkingId === row.item.id}
                       showActions={responseActionIds.has(row.item.id)}
                       showModelTag={row.item.id === lastAssistantId}
@@ -2014,6 +2340,11 @@ export function Conversation({
                     sessionKey={tab.key}
                     cwd={tab.cwd}
                     streaming={streaming}
+                    onAskAgent={(prompt) =>
+                      setDraft((current) =>
+                        current.trim() ? `${current}\n\n${prompt}` : prompt,
+                      )
+                    }
                   />
                 )}
                 {streaming && runningShell ? (
@@ -2117,23 +2448,33 @@ function ThinkingRow({ backend }: { backend: ConversationTab["backend"] }) {
   );
 }
 
-function ContextFill({
-  context,
-}: {
-  context: ReturnType<typeof estimateContext>;
-}) {
+function ContextFill({ context }: { context: ContextUsage }) {
   const percent = context.percent ?? 0;
+  const nearLimit = percent >= 80;
+  const title = context.exact
+    ? [
+        `${context.estimatedTokens.toLocaleString()} of ${context.contextWindow.toLocaleString()} context tokens used (${percent}%)`,
+        context.autoCompactAt
+          ? `Auto-compacts at ${context.autoCompactAt.toLocaleString()}.`
+          : "",
+        ...(context.categories ?? [])
+          .slice(0, 6)
+          .map((entry) => `${entry.name}: ${compactTokens(entry.tokens)}`),
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : `Approximately ${context.estimatedTokens.toLocaleString()} of ${context.contextWindow.toLocaleString()} context tokens used (estimated)`;
   return (
     <div
-      className="context-fill"
+      className={`context-fill${nearLimit ? " is-near-limit" : ""}${context.exact ? " is-exact" : ""}`}
       role="progressbar"
-      aria-label={`Context used: ${percent}%`}
+      aria-label={`Context used: ${percent}%${context.exact ? "" : ", estimated"}`}
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={percent}
-      title={`Approximately ${context.estimatedTokens.toLocaleString()} of ${context.contextWindow.toLocaleString()} context tokens used`}
+      title={title}
     >
-      <span style={{ width: `${percent}%` }} />
+      <span style={{ width: `${Math.min(100, percent)}%` }} />
     </div>
   );
 }
@@ -2145,6 +2486,96 @@ function ContextFill({
  * read as "nothing happened". Rows whose item and flags are unchanged now
  * skip re-rendering entirely.
  */
+/**
+ * "Undo the edits made since this message." Claude Code checkpoints every file
+ * before it writes to it; this restores from those backups. It asks for the
+ * preview first so the click is never blind — a rewind is not itself undoable.
+ */
+function RewindFilesButton({
+  timestamp,
+  disabled,
+  onRewindFiles,
+}: {
+  timestamp: number;
+  disabled?: boolean;
+  onRewindFiles?: (
+    timestamp: number,
+    dryRun: boolean,
+  ) => Promise<RewindFilesResult>;
+}) {
+  const [preview, setPreview] = useState<RewindFilesResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  if (!onRewindFiles) return null;
+
+  const ask = async () => {
+    setBusy(true);
+    try {
+      setPreview(await onRewindFiles(timestamp, true));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      const result = await onRewindFiles(timestamp, false);
+      setPreview(result.error ? result : null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (preview) {
+    const count = preview.filesChanged?.length ?? 0;
+    return (
+      <span className="rewind">
+        {preview.error ? (
+          <span className="rewind__error">{preview.error}</span>
+        ) : (
+          <>
+            <span className="rewind__summary">
+              Restore {count} file{count === 1 ? "" : "s"}
+              {preview.insertions !== undefined
+                ? ` (+${preview.insertions}/−${preview.deletions ?? 0})`
+                : ""}
+              ?
+            </span>
+            <button
+              type="button"
+              className="rewind__confirm"
+              disabled={busy || count === 0}
+              onClick={() => void confirm()}
+            >
+              Restore
+            </button>
+          </>
+        )}
+        <button
+          type="button"
+          className="rewind__cancel"
+          onClick={() => setPreview(null)}
+        >
+          Cancel
+        </button>
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="user-msg__action"
+      aria-label="Restore files to this point"
+      title="Restore files to this point"
+      disabled={disabled || busy}
+      onClick={() => void ask()}
+    >
+      <IconHistory size={13} />
+    </button>
+  );
+}
+
 const TimelineRow = memo(function TimelineRow({
   item,
   onOpenFile,
@@ -2157,6 +2588,8 @@ const TimelineRow = memo(function TimelineRow({
   onEditMessage,
   onCancelEdit,
   onVersionChange,
+  onRewindFiles,
+  subagentChildren,
 }: {
   item: TimelineItem;
   onOpenFile: (view: ToolFileView) => void;
@@ -2172,9 +2605,20 @@ const TimelineRow = memo(function TimelineRow({
     item: Extract<TimelineItem, { kind: "user" }>,
     index: number,
   ) => void;
+  onRewindFiles?: (
+    timestamp: number,
+    dryRun: boolean,
+  ) => Promise<RewindFilesResult>;
+  subagentChildren?: Map<string, Extract<TimelineItem, { kind: "tool" }>[]>;
 }) {
   if (item.kind === "tool")
-    return <ToolCard item={item} onOpenFile={onOpenFile} />;
+    return (
+      <ToolCard
+        item={item}
+        onOpenFile={onOpenFile}
+        children={subagentChildren?.get(item.id) ?? []}
+      />
+    );
   if (item.kind === "notice")
     return <div className={`notice notice--${item.tone}`}>{item.text}</div>;
   if (item.kind === "user") {
@@ -2211,6 +2655,11 @@ const TimelineRow = memo(function TimelineRow({
             >
               <IconPencil size={13} />
             </button>
+            <RewindFilesButton
+              timestamp={item.timestamp}
+              disabled={streaming}
+              onRewindFiles={onRewindFiles}
+            />
           </div>
           {versions && versions.length > 1 && (
             <div

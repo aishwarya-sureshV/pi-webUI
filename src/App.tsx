@@ -12,6 +12,7 @@ import { AuthError, api, setAuthToken } from "./lib/api";
 import { Sidebar } from "./components/Sidebar";
 import { Conversation } from "./components/Conversation";
 import { WorkbenchPage } from "./components/WorkbenchPage";
+import { FleetPage } from "./components/FleetPage";
 import { TerminalPage } from "./components/TerminalPage";
 import { FishLogo } from "./components/icons";
 import type { WorkbenchView } from "./lib/navigation";
@@ -33,6 +34,10 @@ function Frame() {
     () => localStorage.getItem("pi-web.session-layout") === "split",
   );
   const [splitSessionKeys, setSplitSessionKeys] = useState<string[]>([]);
+  // Narrow screens have no room for a permanent sidebar, so it becomes a
+  // drawer. Without this the ≤760px layout hid the sidebar outright and left
+  // no way to reach sessions, skills, the terminal or settings from a phone.
+  const [navOpen, setNavOpen] = useState(false);
   const [paneWidths, setPaneWidths] = useState<Record<string, number>>({});
   const [theme, setTheme] = useState<"light" | "dark">(() =>
     localStorage.getItem("pi-web.theme.v2") === "dark" ? "dark" : "light",
@@ -236,12 +241,36 @@ function Frame() {
 
   return (
     <div
-      className="app-frame"
+      className={`app-frame${navOpen ? " is-nav-open" : ""}`}
       style={{
         gridTemplateColumns: `${sidebarCollapsed ? 56 : sidebarWidth}px minmax(0, 1fr)`,
         ["--pw-sidebar-width" as string]: `${sidebarCollapsed ? 56 : sidebarWidth}px`,
       }}
+      onClickCapture={(event) => {
+        // Any click inside the drawer that isn't the resizer means the user
+        // picked something; get the drawer out of the way.
+        if (!navOpen) return;
+        const target = event.target as HTMLElement;
+        if (target.closest(".sidebar") && !target.closest(".sidebar-resizer"))
+          setNavOpen(false);
+      }}
     >
+      <button
+        type="button"
+        className="nav-toggle"
+        aria-label={navOpen ? "Close navigation" : "Open navigation"}
+        aria-expanded={navOpen}
+        onClick={() => setNavOpen((open) => !open)}
+      >
+        {navOpen ? "✕" : "☰"}
+      </button>
+      {navOpen && (
+        <div
+          className="nav-scrim"
+          role="presentation"
+          onClick={() => setNavOpen(false)}
+        />
+      )}
       <Sidebar
         collapsed={sidebarCollapsed}
         onToggle={toggleSidebar}
@@ -333,8 +362,15 @@ function Frame() {
                 <EmptyCenter />
               )}
             </>
+          ) : view === "fleet" ? (
+            <FleetPage onFocusSession={focusSession} />
           ) : (
-            <WorkbenchPage view={view} theme={theme} onThemeChange={setTheme} />
+            <WorkbenchPage
+              view={view}
+              theme={theme}
+              onThemeChange={setTheme}
+              sessionKey={activeKey}
+            />
           )}
         </div>
         {terminalPane && view === "sessions" && !terminalExpanded && (

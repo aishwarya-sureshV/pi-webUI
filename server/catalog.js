@@ -1,7 +1,7 @@
-/** Read-only catalog of the Pi resources shown by the workbench sidebar. */
-import { readFile, readdir } from 'node:fs/promises'
+/** Catalog of the Pi resources shown by the workbench, plus skill authoring. */
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 
 const AGENT_ROOT = join(homedir(), '.pi', 'agent')
 const SKILLS_ROOT = join(AGENT_ROOT, 'skills')
@@ -107,5 +107,75 @@ export async function loadCatalog() {
     }
   } catch (error) {
     return { ok: false, error: String(error?.message ?? error), skills: [], extensions: [], settings: {} }
+  }
+}
+
+/**
+ * Skill authoring. Skills are just a directory with a SKILL.md inside, so
+ * creating one is writing that file — but the name arrives from the browser,
+ * so it is slugged and then re-checked against the skills root before any
+ * write. A name like "../../.ssh" must not be able to escape.
+ */
+
+/** Directory-safe slug. Returns "" for anything that would not be a safe name. */
+export function skillSlug(name) {
+  const slug = String(name ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+  return slug === '.' || slug === '..' ? '' : slug
+}
+
+/** Resolve a skill directory, refusing anything outside the skills root. */
+function skillDir(slug) {
+  if (!slug) throw new Error('A skill needs a name.')
+  const dir = resolve(SKILLS_ROOT, slug)
+  const rel = relative(SKILLS_ROOT, dir)
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel))
+    throw new Error('That skill name is not allowed.')
+  return dir
+}
+
+/** The SKILL.md source for one skill, for editing. */
+export async function readSkill(name) {
+  try {
+    const dir = skillDir(skillSlug(name))
+    const source = await readFile(join(dir, 'SKILL.md'), 'utf8')
+    return { ok: true, name: basename(dir), source }
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) }
+  }
+}
+
+/**
+ * Create or replace a skill. `name` sets the directory; the frontmatter is
+ * rebuilt from name + description so the file always parses back into the
+ * catalog listing.
+ */
+export async function writeSkill({ name, description, body }) {
+  const slug = skillSlug(name)
+  if (!slug) return { ok: false, error: 'A skill needs a name with letters or digits.' }
+  try {
+    const dir = skillDir(slug)
+    await mkdir(dir, { recursive: true })
+    const title = String(name ?? slug).replace(/\n/g, ' ').trim()
+    const summary = String(description ?? '').replace(/\n/g, ' ').trim()
+    const contents = `---\nname: ${title}\ndescription: ${summary}\n---\n\n${String(body ?? '').trimStart()}\n`
+    await writeFile(join(dir, 'SKILL.md'), contents, 'utf8')
+    return { ok: true, name: slug, path: dir }
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) }
+  }
+}
+
+/** Delete a skill directory. Confined to the skills root like the writes. */
+export async function deleteSkill(name) {
+  try {
+    const dir = skillDir(skillSlug(name))
+    await rm(dir, { recursive: true, force: true })
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) }
   }
 }

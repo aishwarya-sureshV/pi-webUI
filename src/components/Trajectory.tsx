@@ -230,7 +230,7 @@ function TrajectoryDetail({ record }: { record: TrajectoryRecord }) {
           <div className="trajectory__detail-block"><strong>Output</strong><pre>{item.output || '(no output)'}</pre></div>
         </>
       ) : (
-        <div className="trajectory__detail-block"><strong>Content</strong><pre>{item.text}</pre></div>
+        <div className="trajectory__detail-block"><strong>Content</strong><pre>{itemText(item)}</pre></div>
       )}
     </div>
   )

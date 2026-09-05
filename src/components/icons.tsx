@@ -86,23 +86,6 @@ export function IconFolder({ size = 16 }: { size?: number }) {
   );
 }
 
-export function IconShield({ size = 16 }: { size?: number }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      width={size}
-      height={size}
-      aria-hidden
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.3"
-    >
-      <path d="M8 1.8 13 3.6v4.1c0 3-2.1 5.4-5 6.5-2.9-1.1-5-3.5-5-6.5V3.6L8 1.8Z" />
-      <path d="M8 5.5v3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 export function IconCube({ size = 16 }: { size?: number }) {
   return (
     <svg
@@ -621,6 +604,66 @@ export function IconContract({ size = 16 }: { size?: number }) {
       strokeLinejoin="round"
     >
       <path d="M12.8 6.8H9.5V3.5M3.2 9.2H6.5V12.5M9.8 3.5 12.8 6.5M6.2 12.5 3.2 9.5" />
+    </svg>
+  );
+}
+
+/** Counter-clockwise arrow over a clock: restore files to an earlier point. */
+export function IconHistory({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={size}
+      height={size}
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.35"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M2.6 8a5.4 5.4 0 1 0 1.6-3.8" />
+      <path d="M2.4 2.6v3h3" />
+      <path d="M8 5.2V8l2 1.2" />
+    </svg>
+  );
+}
+
+/** Laptop: deploy local (build working tree as-is + restart). */
+export function IconLaptop({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={size}
+      height={size}
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.25"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3" y="3" width="10" height="7.2" rx="0.9" />
+      <path d="M3.2 10.2 2.4 13.2M12.8 10.2l.8 3M1.8 13.2h12.4" />
+    </svg>
+  );
+}
+
+/** Cloud: deploy cloud (git pull + build + restart). */
+export function IconCloud({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={size}
+      height={size}
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.25"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4.6 12.5a3.1 3.1 0 0 1-.5-6.16 4.1 4.1 0 0 1 8-.83 3.05 3.05 0 0 1-.6 6.99H4.6Z" />
     </svg>
   );
 }

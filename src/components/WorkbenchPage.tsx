@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { api, type PiCatalogResponse } from '../lib/api'
+import { api, type AgentSettings, type McpServerInfo, type PiCatalogResponse } from '../lib/api'
 import type { WorkbenchView } from '../lib/navigation'
 import { IconCube, IconExtension, IconRefresh, IconSearch, IconSettings } from './icons'
+import {
+  notificationPermission,
+  notificationsEnabled,
+  notify,
+  requestNotifications,
+  setNotificationsEnabled,
+} from '../lib/notify'
 
 const EMPTY_CATALOG: PiCatalogResponse = { ok: true, skills: [], extensions: [], settings: {} }
 
@@ -9,10 +16,13 @@ export function WorkbenchPage({
   view,
   theme,
   onThemeChange,
+  sessionKey,
 }: {
-  view: Exclude<WorkbenchView, 'sessions'>
+  view: Exclude<WorkbenchView, 'sessions' | 'fleet'>
   theme: 'light' | 'dark'
   onThemeChange: (theme: 'light' | 'dark') => void
+  /** Active conversation, if any — MCP status comes from its running agent. */
+  sessionKey?: string
 }) {
   const [catalog, setCatalog] = useState<PiCatalogResponse>(EMPTY_CATALOG)
   const [loading, setLoading] = useState(true)
@@ -76,15 +86,10 @@ export function WorkbenchPage({
       <div className="resource-page__content" aria-busy={loading}>
         {loading && <div className="resource-page__empty">Loading {title.toLowerCase()}…</div>}
         {!loading && view === 'skills' && (
-          <ResourceList
-            items={skills.map((skill) => ({
-              key: skill.path,
-              icon: <IconCube size={18} />,
-              title: skill.name,
-              description: skill.description,
-              metadata: skill.path,
-            }))}
-            empty={normalizedQuery ? 'No skills match this search.' : 'No local Pi skills are installed.'}
+          <SkillsView
+            skills={skills}
+            query={normalizedQuery}
+            onChanged={refresh}
           />
         )}
         {!loading && view === 'extensions' && (
@@ -101,9 +106,347 @@ export function WorkbenchPage({
           />
         )}
         {!loading && view === 'settings' && (
-          <SettingsView catalog={catalog} theme={theme} onThemeChange={onThemeChange} />
+          <SettingsView catalog={catalog} theme={theme} onThemeChange={onThemeChange} sessionKey={sessionKey} />
         )}
       </div>
+    </div>
+  )
+}
+
+/**
+ * Opt-in for the two notifications the workbench sends. Kept behind an
+ * explicit toggle: the browser only grants the permission from a real click,
+ * and an agent that pings you unasked is worse than one that stays quiet.
+ */
+function NotificationsCard() {
+  const [permission, setPermission] = useState(() => notificationPermission())
+  const [enabled, setEnabled] = useState(() => notificationsEnabled())
+
+  const unsupported = permission === 'unsupported'
+  const blocked = permission === 'denied'
+
+  const toggle = async () => {
+    if (enabled) {
+      setNotificationsEnabled(false)
+      setEnabled(false)
+      return
+    }
+    const granted = await requestNotifications()
+    setPermission(notificationPermission())
+    setEnabled(granted)
+    if (granted) {
+      notify('Notifications on', 'This is what an alert looks like.', 'pi-web-test', { force: true })
+    }
+  }
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card__heading">
+        <IconSettings />
+        <div>
+          <strong>Notifications</strong>
+          <span>Ping this device when an agent needs permission or finishes a turn.</span>
+        </div>
+      </div>
+      {unsupported ? (
+        <p className="settings-card__note">This browser does not support notifications.</p>
+      ) : blocked ? (
+        <p className="settings-card__note">
+          Notifications are blocked for this site. Allow them in your browser&apos;s site settings, then reload.
+        </p>
+      ) : (
+        <div className="settings-card__theme" role="group" aria-label="Notifications">
+          <button type="button" className={enabled ? 'is-active' : ''} aria-pressed={enabled} onClick={() => void toggle()}>
+            {enabled ? 'On' : 'Off'}
+          </button>
+        </div>
+      )}
+      {enabled && (
+        <p className="settings-card__note">
+          Sent only while this page is open and in the background.
+        </p>
+      )}
+    </section>
+  )
+}
+
+/**
+ * MCP servers as the running agent sees them — which is the only view that
+ * distinguishes "configured" from "actually connected". Needs a live session,
+ * so it says so rather than showing an empty list that looks like "none".
+ */
+function McpCard({ sessionKey }: { sessionKey?: string }) {
+  const [servers, setServers] = useState<McpServerInfo[] | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!sessionKey) { setServers(null); setError(''); return }
+    let cancelled = false
+    void api.mcpServers(sessionKey).then((result) => {
+      if (cancelled) return
+      if (result.ok && result.data) { setServers(result.data.servers); setError('') }
+      else { setServers(null); setError(result.error ?? 'MCP status unavailable.') }
+    }).catch(() => { if (!cancelled) { setServers(null); setError('MCP status unavailable.') } })
+    return () => { cancelled = true }
+  }, [sessionKey])
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card__heading">
+        <IconExtension />
+        <div><strong>MCP servers</strong><span>Model Context Protocol servers available to the current session.</span></div>
+      </div>
+      {!sessionKey ? (
+        <p className="settings-card__note">Open a session to see its MCP servers.</p>
+      ) : error ? (
+        <p className="settings-card__note">{error}</p>
+      ) : servers === null ? (
+        <p className="settings-card__note">Loading…</p>
+      ) : servers.length === 0 ? (
+        <p className="settings-card__note">
+          No MCP servers configured. Add one with <code>claude mcp add</code>.
+        </p>
+      ) : (
+        <dl className="settings-card__rows">
+          {servers.map((server) => (
+            <div key={server.name}>
+              <dt>{server.name}</dt>
+              <dd>
+                {server.status}
+                {server.scope ? ` · ${server.scope}` : ''}
+                {server.toolCount !== null ? ` · ${server.toolCount} tools` : ''}
+                {server.error ? ` — ${server.error}` : ''}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </section>
+  )
+}
+
+/**
+ * Claude Code's own settings as the running agent resolved them: what is in
+ * force, which file each scope came from, and every hook that will fire.
+ *
+ * Read-only. The CLI's settings-write control request accepts a single key
+ * (outputStyle), so it cannot honestly back an editor — the files are listed
+ * with their paths instead, and the workspace explorer edits them.
+ */
+function AgentSettingsCard({ sessionKey }: { sessionKey?: string }) {
+  const [settings, setSettings] = useState<AgentSettings | null>(null)
+  const [error, setError] = useState('')
+  const [showRaw, setShowRaw] = useState(false)
+
+  useEffect(() => {
+    if (!sessionKey) { setSettings(null); setError(''); return }
+    let cancelled = false
+    void api.settings(sessionKey).then((result) => {
+      if (cancelled) return
+      if (result.ok && result.data) { setSettings(result.data); setError('') }
+      else { setSettings(null); setError(result.error ?? 'Settings unavailable.') }
+    }).catch(() => { if (!cancelled) { setSettings(null); setError('Settings unavailable.') } })
+    return () => { cancelled = true }
+  }, [sessionKey])
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card__heading">
+        <IconSettings />
+        <div>
+          <strong>Agent settings and hooks</strong>
+          <span>What the running Claude session actually resolved, and where each part came from.</span>
+        </div>
+      </div>
+      {!sessionKey ? (
+        <p className="settings-card__note">Open a session to see its resolved settings.</p>
+      ) : error ? (
+        <p className="settings-card__note">{error}</p>
+      ) : !settings ? (
+        <p className="settings-card__note">Loading…</p>
+      ) : (
+        <>
+          <dl className="settings-card__rows">
+            {settings.sources.map((source) => (
+              <div key={source.source}>
+                <dt>{source.source}</dt>
+                <dd>{Object.keys(source.settings).join(', ') || 'empty'}</dd>
+              </div>
+            ))}
+          </dl>
+
+          <p className="settings-card__note">
+            <strong>{settings.hooks.length}</strong>{' '}
+            {settings.hooks.length === 1 ? 'hook' : 'hooks'} in force
+            {settings.hooks.length > 0 ? ':' : '.'}
+          </p>
+          {settings.hooks.length > 0 && (
+            <dl className="settings-card__rows">
+              {settings.hooks.map((hook, index) => (
+                <div key={`${hook.event}-${index}`}>
+                  <dt>
+                    {hook.event}
+                    {hook.matcher && hook.matcher !== '*' ? ` · ${hook.matcher}` : ''}
+                  </dt>
+                  <dd><code className="settings-card__hook">{hook.command || hook.type}</code></dd>
+                </div>
+              ))}
+            </dl>
+          )}
+
+          <p className="settings-card__note">Settings files (edit these in the workspace explorer):</p>
+          <code className="settings-card__path">{settings.files.userSettings}</code>
+          <code className="settings-card__path">{settings.files.projectSettings}</code>
+          <code className="settings-card__path">{settings.files.localSettings}</code>
+
+          <button type="button" className="settings-card__reveal" onClick={() => setShowRaw((v) => !v)}>
+            {showRaw ? 'Hide' : 'Show'} resolved settings
+          </button>
+          {showRaw && (
+            <pre className="settings-card__raw">{JSON.stringify(settings.effective, null, 2)}</pre>
+          )}
+        </>
+      )}
+    </section>
+  )
+}
+
+type SkillDraft = { name: string; description: string; body: string }
+const EMPTY_DRAFT: SkillDraft = { name: '', description: '', body: '' }
+
+/**
+ * Skills, with authoring. A skill is a directory holding a SKILL.md, so
+ * creating one is writing that file; the server slugs the name and re-checks
+ * it against the skills root before any write.
+ */
+function SkillsView({
+  skills,
+  query,
+  onChanged,
+}: {
+  skills: PiCatalogResponse['skills']
+  query: string
+  onChanged: () => void
+}) {
+  const [draft, setDraft] = useState<SkillDraft | null>(null)
+  const [editingName, setEditingName] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const startNew = () => { setEditingName(null); setError(''); setDraft({ ...EMPTY_DRAFT }) }
+
+  const startEdit = async (name: string, description: string) => {
+    setError(''); setBusy(true)
+    try {
+      const result = await api.readSkill(name)
+      // Strip the frontmatter: it is regenerated from the fields on save, so
+      // editing it by hand here would silently lose the change.
+      const body = (result.source ?? '').replace(/^---\n[\s\S]*?\n---\n*/, '')
+      setEditingName(name)
+      setDraft({ name, description, body })
+    } finally { setBusy(false) }
+  }
+
+  const save = async () => {
+    if (!draft) return
+    setBusy(true); setError('')
+    try {
+      const result = await api.writeSkill(draft)
+      if (!result.ok) { setError(result.error ?? 'Could not save the skill.'); return }
+      setDraft(null); setEditingName(null); onChanged()
+    } finally { setBusy(false) }
+  }
+
+  const remove = async (name: string) => {
+    setBusy(true); setError('')
+    try {
+      const result = await api.deleteSkill(name)
+      if (!result.ok) { setError(result.error ?? 'Could not delete the skill.'); return }
+      onChanged()
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="skills-view">
+      <div className="skills-view__bar">
+        <button type="button" className="skills-view__new" onClick={startNew} disabled={busy}>
+          New skill
+        </button>
+        {error && <span className="skills-view__error">{error}</span>}
+      </div>
+
+      {draft && (
+        <section className="settings-card">
+          <div className="settings-card__heading">
+            <IconCube />
+            <div>
+              <strong>{editingName ? `Edit ${editingName}` : 'New skill'}</strong>
+              <span>Saved to your local Pi skills as a SKILL.md file.</span>
+            </div>
+          </div>
+          <label className="skills-view__field">
+            <span>Name</span>
+            <input
+              value={draft.name}
+              disabled={editingName !== null}
+              onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+              placeholder="Release checklist"
+            />
+          </label>
+          <label className="skills-view__field">
+            <span>Description</span>
+            <input
+              value={draft.description}
+              onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+              placeholder="When to use this skill"
+            />
+          </label>
+          <label className="skills-view__field">
+            <span>Instructions</span>
+            <textarea
+              rows={10}
+              value={draft.body}
+              onChange={(event) => setDraft({ ...draft, body: event.target.value })}
+              placeholder="What the agent should do when this skill applies."
+            />
+          </label>
+          <div className="skills-view__actions">
+            <button type="button" onClick={() => void save()} disabled={busy || !draft.name.trim()}>
+              {busy ? 'Saving…' : 'Save skill'}
+            </button>
+            <button type="button" onClick={() => { setDraft(null); setEditingName(null) }} disabled={busy}>
+              Cancel
+            </button>
+          </div>
+        </section>
+      )}
+
+      {skills.length === 0 ? (
+        <div className="resource-page__empty">
+          {query ? 'No skills match this search.' : 'No local Pi skills are installed.'}
+        </div>
+      ) : (
+        <div className="resource-grid">
+          {skills.map((skill) => (
+            <article key={skill.path} className="resource-card">
+              <div className="resource-card__icon"><IconCube size={18} /></div>
+              <div className="resource-card__text">
+                <strong>{skill.name}</strong>
+                <span>{skill.description}</span>
+                <code>{skill.path}</code>
+              </div>
+              <div className="skills-view__row-actions">
+                <button type="button" disabled={busy} onClick={() => void startEdit(skill.name, skill.description)}>
+                  Edit
+                </button>
+                <button type="button" disabled={busy} onClick={() => void remove(skill.name)}>
+                  Delete
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -139,10 +482,12 @@ function SettingsView({
   catalog,
   theme,
   onThemeChange,
+  sessionKey,
 }: {
   catalog: PiCatalogResponse
   theme: 'light' | 'dark'
   onThemeChange: (theme: 'light' | 'dark') => void
+  sessionKey?: string
 }) {
   const settings = catalog.settings
   const rows = [
@@ -163,6 +508,9 @@ function SettingsView({
           <button type="button" className={theme === 'dark' ? 'is-active' : ''} aria-pressed={theme === 'dark'} onClick={() => onThemeChange('dark')}>Dark</button>
         </div>
       </section>
+      <NotificationsCard />
+      <McpCard sessionKey={sessionKey} />
+      <AgentSettingsCard sessionKey={sessionKey} />
       <section className="settings-card">
         <div className="settings-card__heading"><IconCube /><div><strong>Pi defaults</strong><span>Read from your local Pi settings.</span></div></div>
         <dl className="settings-card__rows">

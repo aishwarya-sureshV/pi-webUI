@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { CO_PARTNER_PROMPT, CLARIFY_PROMPT } from "./co-partner-prompt.js";
 
@@ -218,7 +218,17 @@ function resolveClaudeExecutable() {
 }
 
 function subscriptionEnvironment() {
-  const env = { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" };
+  const env = {
+    ...process.env,
+    FORCE_COLOR: "0",
+    NO_COLOR: "1",
+    // Makes the CLI back up every file before it edits it, which is what the
+    // rewind_files control request restores from. Without this a rewind can
+    // only ever roll back the transcript, leaving the working tree ahead of
+    // the conversation. (The SDK sets the same variable for its
+    // enableFileCheckpointing option.)
+    CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: "true",
+  };
   // Claude Code otherwise silently prefers API/third-party billing over the
   // user's Claude.ai OAuth subscription when these are inherited by the server.
   for (const name of [
@@ -355,6 +365,20 @@ export class ClaudeAgentProcess {
     this.slashCommands = [];
     this.skills = new Set();
     this.seenSubagents = new Set();
+    /**
+     * Control requests this host sent to the CLI, awaiting their responses.
+     * @type {Map<string, { resolve: (value: object) => void, timer: NodeJS.Timeout }>}
+     */
+    this.pendingControlRequests = new Map();
+    this.controlRequestSeq = 0;
+    /**
+     * Prompts submitted while a turn was running, waiting their turn. Held
+     * here rather than written straight to the CLI so they stay cancellable —
+     * once a message is on stdin it is the model's, not the user's.
+     * @type {Array<{ id: string, message: string, images: object[], at: number }>}
+     */
+    this.queuedMessages = [];
+    this.queueSeq = 0;
     /** @type {Set<(event: object) => void>} */
     this.listeners = new Set();
   }
@@ -393,6 +417,7 @@ export class ClaudeAgentProcess {
       sessionId: this.sessionId,
       messageCount: this.messageCount,
       pendingMessageCount: this.pendingTurns.length,
+      queuedMessages: this.queueSnapshot(),
     });
   }
 
@@ -742,6 +767,339 @@ export class ClaudeAgentProcess {
     return usageCache.promise;
   }
 
+  /**
+   * Send a control request and wait for its matching response. The CLI keys
+   * replies by request_id, so anything in flight is tracked here rather than
+   * assumed to arrive in order.
+   */
+  sendControlRequest(request, timeoutMs = 30000) {
+    if (!this.process)
+      return Promise.resolve({ ok: false, error: "Claude process is not running" });
+    this.controlRequestSeq += 1;
+    const requestId = `pi-web-${Date.now()}-${this.controlRequestSeq}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingControlRequests.delete(requestId);
+        resolve({ ok: false, error: `Claude did not answer "${request.subtype}" in time` });
+      }, timeoutMs);
+      this.pendingControlRequests.set(requestId, { resolve, timer });
+      const written = this.writeControl({
+        type: "control_request",
+        request_id: requestId,
+        request,
+      });
+      if (!written) {
+        clearTimeout(timer);
+        this.pendingControlRequests.delete(requestId);
+        resolve({ ok: false, error: "Could not write to the Claude process" });
+      }
+    });
+  }
+
+  /** Resolve whichever sendControlRequest is waiting on this response. */
+  settleControlResponse(event) {
+    const response = event?.response ?? {};
+    const requestId = response.request_id;
+    const pending = requestId
+      ? this.pendingControlRequests.get(requestId)
+      : undefined;
+    if (!pending) return;
+    this.pendingControlRequests.delete(requestId);
+    clearTimeout(pending.timer);
+    if (response.subtype === "success")
+      pending.resolve({ ok: true, data: response.response ?? {} });
+    else
+      pending.resolve({
+        ok: false,
+        error: String(response.error ?? "Claude rejected the request"),
+      });
+  }
+
+  /**
+   * Map a transcript timestamp onto the CLI's own message id. The UI knows
+   * turns by when they happened; rewind_files only speaks uuid.
+   */
+  async userMessageIdAt(timestamp, sessionPath) {
+    // Prefer the transcript named by the live session id: sessionFile can lag
+    // behind a /new or a fork, and reading the previous one yields uuids the
+    // CLI has never heard of.
+    const candidates = [];
+    // The caller's transcript wins: a rewind happens after the turn, by which
+    // point this process may have been reaped and replaced by an empty one
+    // that knows neither the session id nor the file.
+    if (sessionPath) candidates.push(sessionPath);
+    // A session started fresh in the UI has a sessionId long before
+    // sessionFile is populated, so derive the path rather than requiring it.
+    const expected = expectedSessionPath(this.cwd, this.sessionId);
+    if (expected) candidates.push(expected);
+    if (this.sessionId && this.sessionFile)
+      candidates.push(join(dirname(this.sessionFile), `${this.sessionId}.jsonl`));
+    if (this.sessionFile) candidates.push(this.sessionFile);
+    let contents = "";
+    for (const candidate of candidates) {
+      try {
+        contents = await readFile(candidate, "utf8");
+        break;
+      } catch {
+        /* try the next candidate */
+      }
+    }
+    if (!contents) return "";
+    const target = Number(timestamp);
+    let best = "";
+    let bestDelta = Infinity;
+    for (const line of contents.split("\n")) {
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== "user" || typeof entry.uuid !== "string") continue;
+      // Only this session's own messages. sessionFile can still name the
+      // transcript a tab was previously on, and a uuid from a different
+      // session is one the CLI will reject as having no checkpoint.
+      if (
+        !sessionPath &&
+        this.sessionId &&
+        typeof entry.sessionId === "string" &&
+        entry.sessionId !== this.sessionId
+      )
+        continue;
+      // Tool results are logged as user entries too, and land milliseconds
+      // after the prompt they answer — near enough to win a nearest-match.
+      // Only real prompts are rewind targets.
+      const content = entry.message?.content;
+      if (
+        Array.isArray(content) &&
+        content.some((block) => block?.type === "tool_result")
+      )
+        continue;
+      const at = Date.parse(entry.timestamp ?? "");
+      if (!Number.isFinite(at)) continue;
+      const delta = Math.abs(at - target);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        best = entry.uuid;
+      }
+    }
+    // A match more than a minute away is a different turn, not this one.
+    return bestDelta <= 60000 ? best : "";
+  }
+
+  /**
+   * Restore the working tree to the checkpoint taken before a given user
+   * message. `dryRun` reports what would change without touching anything.
+   */
+  async rewindFiles(timestamp, dryRun = false, sessionPath) {
+    const userMessageId = await this.userMessageIdAt(timestamp, sessionPath);
+    if (!userMessageId)
+      return {
+        ok: false,
+        error: "No checkpoint matches that message in this session's log",
+      };
+    const result = await this.sendControlRequest({
+      subtype: "rewind_files",
+      user_message_id: userMessageId,
+      dry_run: dryRun === true,
+    });
+    if (!result.ok) return result;
+    const data = result.data ?? {};
+    if (data.canRewind === false)
+      return { ok: false, error: String(data.error || "Nothing to restore.") };
+    return { ok: true, data: { ...data, dryRun: dryRun === true } };
+  }
+
+  /**
+   * Real context accounting from the CLI, replacing the character-count
+   * estimate. "summary" answers from the last response's usage instead of
+   * re-counting every category, which is what makes it cheap enough to ask
+   * for after every turn.
+   */
+  async getContextUsage() {
+    const result = await this.sendControlRequest(
+      { subtype: "get_context_usage", detail: "summary" },
+      15000,
+    );
+    if (!result.ok) return result;
+    // The wire format is camelCase and the payload is the usage object itself
+    // on current builds; older ones nest it under context_usage.
+    const usage = result.data?.context_usage ?? result.data ?? {};
+    const total = Number(usage.totalTokens ?? usage.total_tokens);
+    const max = Number(
+      usage.rawMaxTokens ?? usage.raw_max_tokens ?? usage.maxTokens,
+    );
+    if (!Number.isFinite(total) || !Number.isFinite(max) || max <= 0)
+      return { ok: false, error: "Claude returned no usable context usage" };
+    return {
+      ok: true,
+      data: {
+        totalTokens: total,
+        maxTokens: max,
+        percent: Number(usage.percentage ?? Math.round((total / max) * 100)),
+        model: String(usage.model ?? ""),
+        autoCompactThreshold: Number(usage.autoCompactThreshold) || 0,
+        isAutoCompactEnabled: usage.isAutoCompactEnabled === true,
+        categories: Array.isArray(usage.categories)
+          ? usage.categories
+              .map((entry) => ({
+                name: String(entry?.name ?? ""),
+                tokens: Number(entry?.tokens) || 0,
+              }))
+              .filter((entry) => entry.name && entry.tokens > 0)
+          : [],
+      },
+    };
+  }
+
+  /** Snapshot for the UI: what is waiting, in the order it will be sent. */
+  queueSnapshot() {
+    return this.queuedMessages.map(({ id, message, at }) => ({
+      id,
+      message,
+      at,
+    }));
+  }
+
+  emitQueue() {
+    this.emit({
+      type: "queue_updated",
+      sessionKey: this.sessionKey,
+      queued: this.queueSnapshot(),
+    });
+  }
+
+  /**
+   * Send now if the agent is idle, otherwise hold it until the running turn
+   * finishes. Returns which of the two happened so the UI can say so.
+   */
+  enqueue(message, images) {
+    const text = String(message ?? "");
+    if (!text.trim()) return Promise.resolve({ ok: false, error: "Empty message" });
+    if (this.pendingTurns.length === 0)
+      return this.prompt(text, images).then((result) =>
+        result.ok ? { ok: true, data: { queued: false } } : result,
+      );
+    this.queueSeq += 1;
+    this.queuedMessages.push({
+      id: `q-${Date.now()}-${this.queueSeq}`,
+      message: text,
+      images: Array.isArray(images) ? images : [],
+      at: Date.now(),
+    });
+    this.emitQueue();
+    return Promise.resolve({
+      ok: true,
+      data: { queued: true, position: this.queuedMessages.length },
+    });
+  }
+
+  /** Drop one waiting message, or all of them when no id is given. */
+  cancelQueued(id) {
+    const before = this.queuedMessages.length;
+    this.queuedMessages = id
+      ? this.queuedMessages.filter((entry) => entry.id !== id)
+      : [];
+    if (this.queuedMessages.length === before)
+      return { ok: false, error: "That message is no longer queued" };
+    this.emitQueue();
+    return { ok: true, data: { cancelled: before - this.queuedMessages.length } };
+  }
+
+  /** Called when the agent goes idle: send the next waiting message, if any. */
+  flushQueue() {
+    const next = this.queuedMessages.shift();
+    if (!next) return;
+    this.emitQueue();
+    void this.prompt(next.message, next.images);
+  }
+
+  /**
+   * Settings as the agent resolved them: the merged view, each file that
+   * contributed, and the hooks in force.
+   *
+   * Read-only on purpose. The CLI's update_settings control request accepts
+   * only `outputStyle`, so it cannot back a real editor; the files themselves
+   * are editable through the workspace explorer, and their paths are returned
+   * here so the UI can point at them.
+   */
+  async getSettings() {
+    const result = await this.sendControlRequest({ subtype: "get_settings" }, 15000);
+    if (!result.ok) return result;
+    const data = result.data ?? {};
+    const sources = Array.isArray(data.sources) ? data.sources : [];
+    const effective = data.effective ?? {};
+    // Flatten hooks into rows the UI can list without re-deriving the shape.
+    const hooks = [];
+    for (const [event, matchers] of Object.entries(effective.hooks ?? {})) {
+      if (!Array.isArray(matchers)) continue;
+      for (const entry of matchers) {
+        for (const hook of entry?.hooks ?? []) {
+          hooks.push({
+            event,
+            matcher: String(entry?.matcher ?? "*"),
+            type: String(hook?.type ?? "command"),
+            command: String(hook?.command ?? ""),
+          });
+        }
+      }
+    }
+    return {
+      ok: true,
+      data: {
+        effective,
+        hooks,
+        sources: sources.map((entry) => ({
+          source: String(entry?.source ?? "unknown"),
+          settings: entry?.settings ?? {},
+        })),
+        localSettings:
+          sources.find((entry) => entry?.source === "localSettings")?.settings ??
+          {},
+        // Where each scope lives on disk, so the UI can open the real file.
+        files: {
+          userSettings: join(homedir(), ".claude", "settings.json"),
+          projectSettings: join(this.cwd, ".claude", "settings.json"),
+          localSettings: join(this.cwd, ".claude", "settings.local.json"),
+        },
+      },
+    };
+  }
+
+  /** Configured MCP servers and whether each one actually connected. */
+  async getMcpServers() {
+    const result = await this.sendControlRequest({ subtype: "mcp_status" }, 15000);
+    if (!result.ok) return result;
+    const servers = Array.isArray(result.data?.mcpServers)
+      ? result.data.mcpServers
+      : [];
+    return {
+      ok: true,
+      data: {
+        servers: servers.map((server) => ({
+          name: String(server?.name ?? "unknown"),
+          status: String(server?.status ?? "pending"),
+          scope: String(server?.scope ?? ""),
+          error: String(server?.error ?? ""),
+          version: String(server?.serverInfo?.version ?? ""),
+          toolCount: Array.isArray(server?.tools) ? server.tools.length : null,
+        })),
+      },
+    };
+  }
+
+  /** Write one control frame to the CLI. Returns false when the pipe is gone. */
+  writeControl(payload) {
+    if (!this.process?.stdin?.writable) return false;
+    try {
+      this.process.stdin.write(`${JSON.stringify(payload)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   readStdout(chunk) {
     this.stdoutBuffer += this.decoder.write(chunk);
     this.drainStdout();
@@ -786,6 +1144,25 @@ export class ClaudeAgentProcess {
       rawType: event.type,
       event,
     });
+
+    if (event.type === "control_request") {
+      // This host implements no inbound control requests. Refuse explicitly:
+      // a silent non-answer would leave the CLI waiting forever.
+      this.writeControl({
+        type: "control_response",
+        response: {
+          subtype: "error",
+          request_id: event.request_id,
+          error: `pi-web does not implement control request "${event.request?.subtype}"`,
+        },
+      });
+      return;
+    }
+    if (event.type === "control_cancel_request") return;
+    if (event.type === "control_response") {
+      this.settleControlResponse(event);
+      return;
+    }
 
     if (event.type === "system" && event.subtype === "init") {
       this.initialized = true;
@@ -880,6 +1257,10 @@ export class ClaudeAgentProcess {
           toolCallId: part.id,
           toolName: part.name,
           args: part.input ?? {},
+          // Set when this call was made by a subagent rather than the main
+          // loop: it is the id of the Task tool call that spawned it, which
+          // is what lets the UI nest the work under its parent.
+          parentToolUseId: event.parent_tool_use_id ?? "",
         });
       });
       const message = {
@@ -948,6 +1329,8 @@ export class ClaudeAgentProcess {
       if (this.pendingTurns.length === 0) {
         this.setStatus("ready");
         this.emit({ type: "agent_settled", sessionKey: this.sessionKey });
+        // Whatever the user lined up while this turn ran goes next.
+        this.flushQueue();
       } else {
         this.setStatus("working");
       }
@@ -1061,6 +1444,15 @@ export class ClaudeAgentProcess {
 
   failPending(error) {
     for (const pending of this.pendingTurns.splice(0)) {
+      pending.resolve({ ok: false, error: String(error?.message ?? error) });
+    }
+    if (this.queuedMessages.length > 0) {
+      this.queuedMessages = [];
+      this.emitQueue();
+    }
+    for (const [requestId, pending] of [...this.pendingControlRequests]) {
+      this.pendingControlRequests.delete(requestId);
+      clearTimeout(pending.timer);
       pending.resolve({ ok: false, error: String(error?.message ?? error) });
     }
   }

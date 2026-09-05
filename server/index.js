@@ -26,7 +26,12 @@
  *   POST /api/:sessionKey/set-thinking     { level }
  *   GET  /api/:sessionKey/git-changes?cwd=  -> branch, remote, per-file working-tree changes
  *   GET  /api/:sessionKey/git-changes?cwd=&file= -> one file's diff vs HEAD
- *   POST /api/:sessionKey/git              { cwd, op: push|pull|commit-push }
+ *   POST /api/:sessionKey/git              { cwd, op } where op is one of
+ *                                          push|pull|pull-rebase|fetch|commit|
+ *                                          commit-push|stash|stash-apply|
+ *                                          stash-pop|stash-drop|branch-create|
+ *                                          branch-switch|undo-commit|continue|
+ *                                          abort
  *   GET  /api/:sessionKey/commands
  *   GET  /api/:sessionKey/models
  *   GET  /api/:sessionKey/thinking-levels
@@ -44,7 +49,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import {
   basename,
   dirname,
@@ -52,11 +57,12 @@ import {
   isAbsolute,
   join,
   normalize,
+  relative,
   resolve,
   sep,
 } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { execFile } from "node:child_process";
+import { spawn, execFile, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
@@ -68,11 +74,17 @@ import {
   archiveSession,
   deleteSession,
   listSessions,
+  searchSessions,
   loadSessionLog,
   readSessionMessages,
   restoreSession,
 } from "./sessions.js";
-import { loadCatalog } from "./catalog.js";
+import {
+  deleteSkill,
+  loadCatalog,
+  readSkill,
+  writeSkill,
+} from "./catalog.js";
 import { listOllamaModels, syncOllamaModelsJson } from "./ollama-models.js";
 import { confinePath, defaultWorkspaceRoots } from "./workspace-paths.js";
 
@@ -96,6 +108,107 @@ const workspaceRoots = new Set(defaultWorkspaceRoots());
 function addWorkspaceRoot(path) {
   if (typeof path === "string" && path.trim())
     workspaceRoots.add(resolve(path));
+}
+
+/** Directories never worth walking for a file picker. */
+const SEARCH_SKIP = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  ".cache",
+  "coverage",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "target",
+  "graphify-out",
+  // Git worktrees hold a second copy of the whole repo; every file would
+  // otherwise show up twice in the picker.
+  "worktrees",
+]);
+const SEARCH_MAX_MATCHES = 40;
+const SEARCH_MAX_VISITS = 20000;
+
+/**
+ * Breadth-first walk of a workspace root, returning paths that match `query`.
+ * Breadth-first so shallow files — the ones a person is most likely to mean —
+ * are found before deep ones, and both the match count and the total number of
+ * entries visited are capped so a huge tree cannot stall the request.
+ */
+async function searchWorkspaceFiles(root, query) {
+  const matches = [];
+  const queue = [root];
+  let visits = 0;
+  while (queue.length > 0 && matches.length < SEARCH_MAX_MATCHES) {
+    const dir = queue.shift();
+    let entries = [];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue; // unreadable directory; keep going
+    }
+    for (const entry of entries) {
+      if (++visits > SEARCH_MAX_VISITS)
+        return rankSearchMatches(matches, query);
+      if (entry.name.startsWith(".") && entry.name !== ".claude") continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SEARCH_SKIP.has(entry.name)) queue.push(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relativePath = relative(root, full);
+      if (query && !relativePath.toLowerCase().includes(query)) continue;
+      matches.push({ path: full, relativePath, name: entry.name });
+      if (matches.length >= SEARCH_MAX_MATCHES) break;
+    }
+  }
+  return rankSearchMatches(matches, query);
+}
+
+/** Basename hits first, then shallower paths, then alphabetical. */
+function rankSearchMatches(matches, query) {
+  return matches
+    .map((match) => ({
+      ...match,
+      score:
+        (query && match.name.toLowerCase().startsWith(query) ? 0 : 2) +
+        (query && match.name.toLowerCase().includes(query) ? 0 : 1),
+      depth: match.relativePath.split("/").length,
+    }))
+    .sort(
+      (left, right) =>
+        left.score - right.score ||
+        left.depth - right.depth ||
+        left.relativePath.localeCompare(right.relativePath),
+    )
+    .slice(0, SEARCH_MAX_MATCHES)
+    .map(({ path, relativePath, name }) => ({ path, relativePath, name }));
+}
+
+/**
+ * Split one file's unified diff into its header and its hunks. A patch that
+ * applies only hunk N is the header plus that hunk and nothing else — which is
+ * what makes reverting a single hunk possible without touching the others.
+ */
+export function splitDiffHunks(diff) {
+  const lines = String(diff ?? "").split("\n");
+  const header = [];
+  const hunks = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      if (current) hunks.push(current);
+      current = { header: line, lines: [line] };
+      continue;
+    }
+    if (current) current.lines.push(line);
+    else header.push(line);
+  }
+  if (current) hunks.push(current);
+  return { header, hunks };
 }
 
 function confineWorkspacePath(requested) {
@@ -234,6 +347,92 @@ const BUILD_ID = existsSync(join(DIST, "index.html"))
       .slice(0, 12)
   : "dev";
 
+/**
+ * One-click deploy (the Deploy button in the conversation header).
+ *
+ * The server never rebuilds itself: POST /api/deploy spawns scripts/deploy.mjs
+ * as a detached process and answers immediately. The deployer (git pull in
+ * cloud mode -> npm run build) reports progress only through this state file,
+ * then SIGTERMs this process so the supervisor restarts it with fresh code.
+ */
+const BOOT_MS = Date.now();
+const DEPLOY_STATE_PATH = join(ROOT, ".pi-web-deploy.json");
+const DEPLOY_MODE =
+  process.env.PI_WEB_DEPLOY_MODE === "cloud" ? "cloud" : "local";
+
+function readDeployState() {
+  try {
+    return JSON.parse(readFileSync(DEPLOY_STATE_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeDeployState(patch) {
+  const base = readDeployState() || {};
+  try {
+    writeFileSync(
+      DEPLOY_STATE_PATH,
+      JSON.stringify({ ...base, ...patch }, null, 2),
+    );
+  } catch {
+    // Best-effort status reporting; a missing state file just means the UI
+    // shows "never deployed".
+  }
+}
+
+function currentGitHead() {
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Content signature of the whole working tree: HEAD + status + diff, hashed.
+ * The deployer stores this at deploy time, so /api/deploy/status can answer
+ * "does the working tree differ from what is running?" — including uncommitted
+ * edits, which HEAD alone can't see.
+ */
+function workingTreeSignature() {
+  try {
+    const out = execSync(
+      "git rev-parse HEAD && git status --porcelain && git diff HEAD",
+      {
+        cwd: ROOT,
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+    return createHash("sha256").update(out).digest("hex").slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+function uncommittedFileCount() {
+  try {
+    const out = execSync("git status --porcelain", {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    })
+      .toString()
+      .trim();
+    return out ? out.split("\n").length : 0;
+  } catch {
+    return null;
+  }
+}
+
 const piPool = new PiAgentPool();
 const claudePool = new ClaudeAgentPool();
 const grokPool = new GrokAgentPool();
@@ -256,6 +455,7 @@ const MIME = {
   ".png": "image/png",
   ".woff2": "font/woff2",
   ".ico": "image/x-icon",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
 };
 
 function broadcast(event) {
@@ -268,6 +468,11 @@ function broadcast(event) {
     }
   }
 }
+
+// Heartbeat so a client can tell an idle stream from a half-open socket
+// (sleep/wake, a proxy dropping the connection without a reset) and reconnect
+// when the beats stop. Carries no sessionKey, so the UI ignores it.
+setInterval(() => broadcast({ type: "__ping" }), 10_000).unref();
 
 function logPayload(event) {
   if (event && typeof event === "object" && !Array.isArray(event)) return event;
@@ -675,6 +880,70 @@ function readFileSyncSafe(p) {
   }
 }
 
+// Git operations the UI is allowed to run. Anything outside this set falls
+// back to `push`; anything user-typed (branch name, stash ref, file paths) is
+// pattern-validated before it reaches argv.
+const GIT_WRITE_OPS = new Set([
+  "push",
+  "pull",
+  "pull-rebase",
+  "fetch",
+  "commit",
+  "commit-push",
+  "stash",
+  "stash-apply",
+  "stash-pop",
+  "stash-drop",
+  "branch-create",
+  "branch-switch",
+  "undo-commit",
+  "continue",
+  "abort",
+]);
+
+/**
+ * Which half-finished operation the repo is sitting in. git records these as
+ * marker files in the git dir; until one is concluded, an ordinary commit
+ * would bake the working tree (conflict markers included) into history.
+ */
+function gitStateFromDir(gitDir) {
+  const marker = (name) => Boolean(gitDir) && existsSync(join(gitDir, name));
+  if (marker("MERGE_HEAD")) return "merging";
+  if (marker("rebase-merge") || marker("rebase-apply")) return "rebasing";
+  if (marker("CHERRY_PICK_HEAD")) return "cherry-picking";
+  if (marker("REVERT_HEAD")) return "reverting";
+  return "clean";
+}
+
+async function gitProgressState(dir) {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", dir, "rev-parse", "--absolute-git-dir"],
+      { timeout: 10_000 },
+    );
+    return gitStateFromDir(String(stdout).trim());
+  } catch {
+    return "clean";
+  }
+}
+
+/** git check-ref-format's rules, tightened: no globs, no leading dash. */
+function isSafeBranchName(name) {
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    name.length <= 200 &&
+    /^[A-Za-z0-9._/+-]+$/.test(name) &&
+    !name.startsWith("-") &&
+    !name.startsWith("/") &&
+    !name.endsWith("/") &&
+    !name.endsWith(".lock") &&
+    !name.includes("..") &&
+    !name.includes("//")
+  );
+}
+
 const MAX_WORKSPACE_FILE_BYTES = 1_048_576;
 const MAX_WORKSPACE_WRITE_BYTES = 2_097_152;
 const MAX_WORKSPACE_ENTRIES = 2_000;
@@ -1026,6 +1295,8 @@ async function route(req, res) {
       ok: true,
       version: "0.1.0",
       buildId: BUILD_ID,
+      bootMs: BOOT_MS,
+      pid: process.pid,
       cwd: process.cwd(),
     });
   }
@@ -1060,6 +1331,85 @@ async function route(req, res) {
 
   if (pathname === "/api/auth/status" && req.method === "GET") {
     return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/deploy/status" && req.method === "GET") {
+    const state = readDeployState();
+    const stale = Boolean(
+      state?.status === "running" &&
+        Date.now() - (state.startedAt || 0) > 15 * 60_000,
+    );
+    return sendJson(res, 200, {
+      ok: true,
+      mode: DEPLOY_MODE,
+      head: currentGitHead(),
+      signature: workingTreeSignature(),
+      dirtyFiles: uncommittedFileCount(),
+      deploying: state?.status === "running" && !stale,
+      stale,
+      last: state,
+      lastLocal: state?.lastLocal ?? null,
+      lastCloud: state?.lastCloud ?? null,
+    });
+  }
+
+  if (pathname === "/api/deploy" && req.method === "POST") {
+    // Requested mode comes from the button clicked; the env default only
+    // applies to callers that don't specify one.
+    const body = await readBody(req);
+    const requestedMode =
+      body?.mode === "cloud" || body?.mode === "local"
+        ? body.mode
+        : DEPLOY_MODE;
+    const state = readDeployState();
+    if (
+      state?.status === "running" &&
+      Date.now() - (state.startedAt || 0) < 15 * 60_000
+    ) {
+      return sendJson(res, 409, {
+        ok: false,
+        error: "A deploy is already running.",
+      });
+    }
+    writeDeployState({
+      status: "running",
+      mode: requestedMode,
+      startedAt: Date.now(),
+      finishedAt: null,
+      commit: currentGitHead(),
+      steps: [],
+      log: "",
+      error: null,
+    });
+    try {
+      const child = spawn(
+        process.execPath,
+        [join(ROOT, "scripts", "deploy.mjs")],
+        {
+          cwd: ROOT,
+          detached: true,
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            PI_WEB_DEPLOY_MODE: requestedMode,
+            PI_WEB_DEPLOY_STATE: DEPLOY_STATE_PATH,
+            PI_WEB_SERVER_PID: String(process.pid),
+          },
+        },
+      );
+      child.unref();
+    } catch (error) {
+      writeDeployState({
+        status: "failed",
+        finishedAt: Date.now(),
+        error: `Failed to start deployer: ${error?.message || error}`,
+      });
+      return sendJson(res, 500, {
+        ok: false,
+        error: "Failed to start deploy.",
+      });
+    }
+    return sendJson(res, 200, { ok: true, mode: requestedMode });
   }
 
   if (pathname === "/api/directories" && req.method === "GET") {
@@ -1113,6 +1463,26 @@ async function route(req, res) {
       confineHomePath(requested);
       const result = await listWorkspace(requested);
       return sendJson(res, result.ok ? 200 : 400, result);
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: workspaceIoError(error, "directory"),
+      });
+    }
+  }
+
+  // Backs the composer's "@" file picker. Deliberately not Claude Code's
+  // file_suggestions control request: this works for every backend, and the
+  // CLI's matcher is inconsistent for partial path fragments.
+  if (pathname === "/api/workspace/search" && req.method === "GET") {
+    const root = url.searchParams.get("root")?.trim();
+    const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    if (!root)
+      return sendJson(res, 400, { ok: false, error: "Missing search root." });
+    try {
+      confineHomePath(root);
+      const matches = await searchWorkspaceFiles(root, query);
+      return sendJson(res, 200, { ok: true, matches });
     } catch (error) {
       return sendJson(res, 400, {
         ok: false,
@@ -1206,6 +1576,28 @@ async function route(req, res) {
     return sendJson(res, 200, await loadCatalog());
   }
 
+  // Skill authoring. Confinement to the skills root lives in catalog.js, next
+  // to the writes it protects.
+  if (pathname === "/api/catalog/skill" && req.method === "GET") {
+    const name = url.searchParams.get("name") ?? "";
+    const result = await readSkill(name);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+  if (pathname === "/api/catalog/skill" && req.method === "PUT") {
+    const body = await readBody(req);
+    const result = await writeSkill({
+      name: String(body.name ?? ""),
+      description: String(body.description ?? ""),
+      body: String(body.body ?? ""),
+    });
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+  if (pathname === "/api/catalog/skill" && req.method === "DELETE") {
+    const name = url.searchParams.get("name") ?? "";
+    const result = await deleteSkill(name);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
   if (pathname === "/api/session-log" && req.method === "GET") {
     const result = await loadSessionLog(url.searchParams.get("path") ?? "");
     if (!result.ok) return sendJson(res, 400, result);
@@ -1225,6 +1617,17 @@ async function route(req, res) {
       res,
       200,
       await readSessionMessages(url.searchParams.get("path") || ""),
+    );
+  }
+
+  if (pathname === "/api/sessions/search" && req.method === "GET") {
+    return sendJson(
+      res,
+      200,
+      await searchSessions({
+        query: url.searchParams.get("q") ?? "",
+        backend: backendName(url.searchParams.get("backend")),
+      }),
     );
   }
 
@@ -1395,6 +1798,43 @@ async function route(req, res) {
       ),
     );
   }
+  if (req.method === "POST" && action === "queue") {
+    const body = await readBody(req);
+    const agent = watch(sessionKey);
+    if (typeof agent.enqueue !== "function")
+      return sendJson(res, 400, {
+        ok: false,
+        error: "This backend does not queue messages",
+      });
+    return sendJson(
+      res,
+      200,
+      await runLoggedCommand(sessionKey, "queue", body, () =>
+        agent.enqueue(
+          String(body.message ?? ""),
+          Array.isArray(body.images) ? body.images : undefined,
+        ),
+      ),
+    );
+  }
+  if (req.method === "POST" && action === "queue-cancel") {
+    const body = await readBody(req);
+    const agent = watch(sessionKey);
+    if (typeof agent.cancelQueued !== "function")
+      return sendJson(res, 400, {
+        ok: false,
+        error: "This backend does not queue messages",
+      });
+    return sendJson(
+      res,
+      200,
+      await runLoggedCommand(sessionKey, "queue-cancel", body, () =>
+        agent.cancelQueued(
+          typeof body.id === "string" && body.id ? body.id : undefined,
+        ),
+      ),
+    );
+  }
   if (req.method === "POST" && action === "abort") {
     return sendJson(
       res,
@@ -1545,10 +1985,78 @@ async function route(req, res) {
     );
     return sendJson(res, result.ok ? 200 : 500, result);
   }
+  if (req.method === "GET" && action === "settings") {
+    const agent = watch(sessionKey);
+    if (typeof agent.getSettings !== "function")
+      return sendJson(res, 200, {
+        ok: false,
+        error: "This backend does not expose settings",
+      });
+    return sendJson(res, 200, await agent.getSettings());
+  }
+  if (req.method === "GET" && action === "mcp") {
+    const agent = watch(sessionKey);
+    if (typeof agent.getMcpServers !== "function")
+      return sendJson(res, 200, {
+        ok: false,
+        error: "This backend does not expose MCP servers",
+      });
+    return sendJson(res, 200, await agent.getMcpServers());
+  }
+  if (req.method === "GET" && action === "context") {
+    const agent = watch(sessionKey);
+    if (typeof agent.getContextUsage !== "function")
+      return sendJson(res, 200, {
+        ok: false,
+        error: "This backend does not report context usage",
+      });
+    return sendJson(res, 200, await agent.getContextUsage());
+  }
+  if (req.method === "POST" && action === "rewind-files") {
+    const body = await readBody(req);
+    const agent = watch(sessionKey);
+    if (typeof agent.rewindFiles !== "function")
+      return sendJson(res, 400, {
+        ok: false,
+        error: "This backend does not checkpoint files",
+      });
+    // Restoring happens after the turn, so the agent may have been reaped
+    // since. Resume it first — the control request needs a live CLI.
+    const rewindCwd = typeof body.cwd === "string" ? body.cwd : "";
+    const rewindSessionPath =
+      typeof body.sessionPath === "string" ? body.sessionPath : "";
+    if (agent.status !== "ready" && agent.status !== "working" && rewindCwd) {
+      await runLoggedCommand(sessionKey, "start", { cwd: rewindCwd }, () =>
+        agent.start(
+          rewindCwd,
+          rewindSessionPath ? { sessionPath: rewindSessionPath } : {},
+        ),
+      );
+    }
+    const result = await runLoggedCommand(
+      sessionKey,
+      "rewind-files",
+      body,
+      () =>
+        agent.rewindFiles(
+          Number(body.timestamp),
+          body.dryRun === true,
+          rewindSessionPath || undefined,
+        ),
+    );
+    return sendJson(res, result.ok ? 200 : 500, result);
+  }
   if (req.method === "POST" && action === "truncate") {
     const body = await readBody(req);
+    const agent = watch(sessionKey);
+    if (typeof agent.truncateAt !== "function")
+      return sendJson(res, 400, {
+        ok: false,
+        error:
+          "This backend cannot rewind a conversation yet. Use \u201cRestore files to this point\u201d to undo the edits instead.",
+      });
     const result = await runLoggedCommand(sessionKey, "truncate", body, () =>
-      watch(sessionKey).truncateAt(
+      agent.truncateAt(
         Number(body.userTimestamp),
         typeof body.sessionPath === "string" && body.sessionPath
           ? body.sessionPath
@@ -1628,13 +2136,43 @@ async function route(req, res) {
         diff: text.slice(0, 200_000),
       });
     }
-    const [remoteProbe, branchProbe, statusProbe, numstatProbe] =
-      await Promise.all([
-        git(["remote", "get-url", "origin"]),
-        git(["branch", "--show-current"]),
-        git(["status", "--porcelain=v1", "--no-renames"]),
-        git(["diff", "--numstat", "HEAD"]),
-      ]);
+    const [
+      remoteProbe,
+      branchProbe,
+      statusProbe,
+      numstatProbe,
+      trackingProbe,
+      gitDirProbe,
+      stashProbe,
+      branchListProbe,
+      remoteListProbe,
+    ] = await Promise.all([
+      git(["remote", "get-url", "origin"]),
+      git(["branch", "--show-current"]),
+      git(["status", "--porcelain=v1", "--no-renames"]),
+      git(["diff", "--numstat", "HEAD"]),
+      // Fails (not ok) when the branch has no upstream — that is the signal
+      // for "never pushed", not an error worth surfacing.
+      git(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]),
+      git(["rev-parse", "--absolute-git-dir"]),
+      git(["stash", "list", "--format=%gd%x09%gs%x09%cr"]),
+      git([
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--count=30",
+        "--format=%(refname:short)",
+        "refs/heads",
+      ]),
+      // Remote-tracking refs so a branch someone else pushed is reachable
+      // after a fetch; `git switch <name>` turns one into a local branch.
+      git([
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--count=30",
+        "--format=%(refname:short)",
+        "refs/remotes",
+      ]),
+    ]);
     const remote = remoteProbe.ok ? remoteProbe.stdout.trim() : "";
     const branch = branchProbe.stdout.trim() || "(detached)";
     const counts = new Map();
@@ -1652,6 +2190,9 @@ async function route(req, res) {
       const code = row.slice(0, 2);
       const path = row.slice(3).replace(/^"|"$/g, "");
       const untracked = code.startsWith("??");
+      // Unmerged index states: both/either side added, deleted or modified.
+      // They are NOT "modified" — committing one writes conflict markers.
+      const conflicted = code === "AA" || code === "DD" || code.includes("U");
       const letter = untracked ? "A" : code[1] === "." ? code[0] : code[1];
       if (untracked) {
         const probe = await git([
@@ -1671,14 +2212,43 @@ async function route(req, res) {
       const stat = counts.get(path) ?? { additions: 0, deletions: 0 };
       changes.push({
         path,
-        status:
-          letter === "A" ? "added" : letter === "D" ? "deleted" : "modified",
+        status: conflicted
+          ? "conflicted"
+          : letter === "A"
+            ? "added"
+            : letter === "D"
+              ? "deleted"
+              : "modified",
         additions: stat.additions,
         deletions: stat.deletions,
       });
       // One row per file: a path can appear staged AND worktree-modified;
       // skip duplicates (deeper status merge would double-count).
       counts.delete(path);
+    }
+    const tracking = trackingProbe.stdout.trim().match(/^(\d+)\s+(\d+)$/);
+    const state = gitStateFromDir(gitDirProbe.stdout.trim());
+    const stashes = [];
+    for (const row of stashProbe.stdout.split("\n")) {
+      const [ref, label, age] = row.split("\t");
+      if (!/^stash@\{\d+\}$/.test(ref ?? "")) continue;
+      stashes.push({ ref, label: label ?? "", age: age ?? "" });
+    }
+    const branches = branchListProbe.stdout
+      .split("\n")
+      .map((row) => row.trim())
+      .filter(Boolean);
+    const local = new Set(branches);
+    // Strip the remote prefix and drop anything already checked out locally or
+    // pointing at HEAD — what is left is "branches you could switch to".
+    const remoteBranches = [];
+    for (const row of remoteListProbe.stdout.split("\n")) {
+      const ref = row.trim();
+      const slash = ref.indexOf("/");
+      if (slash < 0 || ref.endsWith("/HEAD")) continue;
+      const name = ref.slice(slash + 1);
+      if (local.has(name) || remoteBranches.includes(name)) continue;
+      remoteBranches.push(name);
     }
     return sendJson(res, 200, {
       ok: true,
@@ -1687,12 +2257,109 @@ async function route(req, res) {
       remote,
       branch,
       changes,
+      upstream: trackingProbe.ok,
+      ahead: tracking ? Number(tracking[1]) : 0,
+      behind: tracking ? Number(tracking[2]) : 0,
+      stashes,
+      branches,
+      remoteBranches,
+      state,
+      conflicts: changes
+        .filter((change) => change.status === "conflicted")
+        .map((change) => change.path),
     });
   }
+  // Revert a single hunk of a file's working-tree changes: rebuild a patch
+  // containing just that hunk and apply it in reverse.
+  if (req.method === "POST" && action === "git-hunk") {
+    const body = await readBody(req);
+    const dir =
+      typeof body.cwd === "string" && body.cwd ? body.cwd : process.cwd();
+    const file = String(body.file ?? "");
+    const hunkIndex = Number(body.hunkIndex);
+    try {
+      confineWorkspacePath(dir);
+      if (
+        !file ||
+        isAbsolute(file) ||
+        file.split(/[\\/]/).includes("..") ||
+        file.startsWith(":")
+      )
+        throw new Error(`Invalid file path: ${file}`);
+      if (!Number.isInteger(hunkIndex) || hunkIndex < 0)
+        throw new Error("Invalid hunk index.");
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: String(error?.message ?? error),
+      });
+    }
+    return sendJson(
+      res,
+      200,
+      await runLoggedCommand(sessionKey, "git-hunk", body, async () => {
+        let diff = "";
+        try {
+          const { stdout } = await execFileAsync(
+            "git",
+            ["-C", dir, "diff", "--unified=3", "--", file],
+            { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+          );
+          diff = String(stdout);
+        } catch (error) {
+          return {
+            ok: false,
+            error: String(error?.stderr || error?.message || error),
+          };
+        }
+        if (!diff.trim())
+          return {
+            ok: false,
+            error:
+              "No tracked changes for that file — an untracked file has no hunks to revert.",
+          };
+        const { header, hunks } = splitDiffHunks(diff);
+        const hunk = hunks[hunkIndex];
+        if (!hunk)
+          return { ok: false, error: "That hunk is no longer in the diff." };
+        const patch = `${[...header, ...hunk.lines].join("\n").replace(/\n*$/, "")}\n`;
+        const applied = await new Promise((resolve) => {
+          const child = spawn(
+            "git",
+            ["-C", dir, "apply", "--reverse", "--recount", "-"],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          let stderr = "";
+          child.stderr.on("data", (chunk) => {
+            stderr += chunk;
+          });
+          child.on("error", (error) =>
+            resolve({ ok: false, error: String(error?.message ?? error) }),
+          );
+          child.on("close", (code) =>
+            resolve(
+              code === 0
+                ? { ok: true }
+                : {
+                    ok: false,
+                    error: stderr.trim() || `git apply exited ${code}`,
+                  },
+            ),
+          );
+          child.stdin.end(patch);
+        });
+        if (!applied.ok) return applied;
+        return {
+          ok: true,
+          data: { file, hunkIndex, remaining: hunks.length - 1 },
+        };
+      }),
+    );
+  }
+
   if (req.method === "POST" && action === "git") {
     const body = await readBody(req);
-    const op =
-      body.op === "pull" || body.op === "commit-push" ? body.op : "push";
+    const op = GIT_WRITE_OPS.has(body.op) ? body.op : "push";
     const dir =
       typeof body.cwd === "string" && body.cwd ? body.cwd : process.cwd();
     // git pull/push run repo hooks (post-merge, pre-push) as this user, so the
@@ -1710,59 +2377,143 @@ async function route(req, res) {
       `git-${op}`,
       body,
       async () => {
+        const run = (args) =>
+          execFileAsync("git", ["-C", dir, ...args], {
+            timeout: 120_000,
+            maxBuffer: 4 * 1024 * 1024,
+          });
+        const text = (done) => `${done.stdout}${done.stderr}`.trim();
+        // Optional file selection: when the client sends `files`, act on only
+        // those (paths are repo-relative and validated); otherwise act on the
+        // whole tree. Returns undefined when the client sent no selection.
+        const pickFiles = () => {
+          if (!Array.isArray(body.files)) return undefined;
+          const files = body.files.filter((f) => typeof f === "string" && f);
+          if (files.length === 0) throw new Error("No files selected.");
+          for (const file of files) {
+            if (
+              isAbsolute(file) ||
+              file.split(/[\\/]/).includes("..") ||
+              file.startsWith(":")
+            )
+              throw new Error(`Invalid file path: ${file}`);
+          }
+          return files;
+        };
+        // Paths git still considers unmerged. `git add` + `git commit` on one
+        // of these silently records the conflict markers as the resolution,
+        // so every op that commits has to refuse while any exist.
+        const unmergedPaths = async () => {
+          try {
+            const done = await run(["diff", "--name-only", "--diff-filter=U"]);
+            return done.stdout.split("\n").filter(Boolean);
+          } catch {
+            return [];
+          }
+        };
         try {
-          if (op === "commit-push") {
+          if (op === "continue" || op === "abort") {
+            const state = await gitProgressState(dir);
+            if (state === "clean")
+              return {
+                ok: false,
+                error: "No merge, rebase, cherry-pick or revert in progress.",
+              };
+            const command =
+              state === "merging"
+                ? "merge"
+                : state === "rebasing"
+                  ? "rebase"
+                  : state === "cherry-picking"
+                    ? "cherry-pick"
+                    : "revert";
+            if (op === "abort") {
+              const done = await run([command, "--abort"]);
+              return {
+                ok: true,
+                output:
+                  text(done) ||
+                  `Aborted the ${command}; the repo is back where it started.`,
+              };
+            }
+            // An unmerged index entry is not itself a blocker — git keeps one
+            // until the resolution is staged, which is what Continue does
+            // next. What must not pass is a file still holding markers.
+            const unresolved = [];
+            for (const path of await unmergedPaths()) {
+              try {
+                const content = readFileSync(join(dir, path), "utf8");
+                if (/^<{7}/m.test(content) || /^>{7}/m.test(content))
+                  unresolved.push(path);
+              } catch {
+                /* deleted or binary: let git judge it at --continue */
+              }
+            }
+            if (unresolved.length)
+              return {
+                ok: false,
+                error: `Conflict markers are still in:\n${unresolved.join("\n")}`,
+              };
+            // Stage the resolutions, then let git write the merge/rebase commit
+            // with its own prepared message (GIT_EDITOR=true accepts it).
+            await run(["add", "-A"]);
+            const done = await execFileAsync(
+              "git",
+              ["-C", dir, command, "--continue"],
+              {
+                timeout: 120_000,
+                maxBuffer: 4 * 1024 * 1024,
+                env: { ...process.env, GIT_EDITOR: "true" },
+              },
+            );
+            return {
+              ok: true,
+              output: text(done) || `Finished the ${command}.`,
+            };
+          }
+          if (op === "commit" || op === "commit-push") {
             const message =
               typeof body.message === "string" ? body.message.trim() : "";
             if (!message)
               return { ok: false, error: "Commit message required." };
-            const run = (args) =>
-              execFileAsync("git", ["-C", dir, ...args], {
-                timeout: 120_000,
-                maxBuffer: 4 * 1024 * 1024,
-              });
+            const blocked = await unmergedPaths();
+            if (blocked.length)
+              return {
+                ok: false,
+                error: `Cannot commit with an unresolved conflict in:\n${blocked.join("\n")}\nResolve them, then use Continue.`,
+              };
             const out = [];
-            // Optional file selection: when the client sends `files`, stage
-            // only those (paths are repo-relative and validated); otherwise
-            // stage everything. Unselected files stay in the working tree.
-            const files = Array.isArray(body.files)
-              ? body.files.filter((f) => typeof f === "string" && f)
-              : undefined;
-            if (files) {
-              if (files.length === 0)
-                return { ok: false, error: "No files selected." };
-              for (const file of files) {
-                if (
-                  isAbsolute(file) ||
-                  file.split(/[\\/]/).includes("..") ||
-                  file.startsWith(":")
-                )
-                  return { ok: false, error: `Invalid file path: ${file}` };
-              }
-              await run(["add", "--", ...files]);
-            } else {
-              await run(["add", "-A"]);
-            }
+            const files = pickFiles();
+            // A selective commit takes a pathspec rather than the bare index,
+            // so files staged outside this request (a manual git add, an old
+            // client) can never ride along.
             try {
-              const commit = await run(["commit", "-m", message]);
-              out.push(`${commit.stdout}${commit.stderr}`.trim());
+              await run(files ? ["add", "--", ...files] : ["add", "-A"]);
+              const commit = await run(
+                files
+                  ? ["commit", "-m", message, "--", ...files]
+                  : ["commit", "-m", message],
+              );
+              out.push(text(commit));
             } catch (error) {
-              const text = String(error?.stderr || error?.message || error);
-              if (!/nothing to commit|no changes added/i.test(text))
-                return { ok: false, error: text };
+              const failure = String(error?.stderr || error?.message || error);
+              if (!/nothing to commit|no changes added/i.test(failure))
+                return { ok: false, error: failure };
               out.push("Nothing new to commit.");
             }
+            if (op === "commit")
+              return { ok: true, output: out.filter(Boolean).join("\n") };
             try {
               const push = await run(["push"]);
-              out.push(`${push.stdout}${push.stderr}`.trim());
+              out.push(text(push));
             } catch (error) {
-              const text = String(error?.stderr || error?.message || error);
-              if (!/no upstream|has no upstream/i.test(text))
-                return { ok: false, error: text };
+              const failure = String(error?.stderr || error?.message || error);
+              if (!/no upstream|has no upstream/i.test(failure))
+                return { ok: false, error: failure };
               // First push of a fresh branch: bind it to origin.
               try {
                 const retry = await run(["push", "-u", "origin", "HEAD"]);
-                out.push(`${retry.stdout}${retry.stderr}`.trim());
+                out.push(text(retry));
               } catch (error2) {
                 return {
                   ok: false,
@@ -1772,12 +2523,74 @@ async function route(req, res) {
             }
             return { ok: true, output: out.filter(Boolean).join("\n") };
           }
-          const { stdout, stderr } = await execFileAsync(
-            "git",
-            ["-C", dir, op],
-            { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
-          );
-          return { ok: true, output: `${stdout}${stderr}`.trim() };
+          if (op === "stash") {
+            const label =
+              typeof body.message === "string" ? body.message.trim() : "";
+            // -u so a stash actually empties the tree the Changes list shows;
+            // untracked files are the common case for a fresh agent turn.
+            const args = ["stash", "push", "--include-untracked"];
+            if (label) args.push("-m", label.slice(0, 200));
+            const files = pickFiles();
+            if (files) args.push("--", ...files);
+            const done = await run(args);
+            return { ok: true, output: text(done) || "Nothing to stash." };
+          }
+          if (
+            op === "stash-apply" ||
+            op === "stash-pop" ||
+            op === "stash-drop"
+          ) {
+            const ref = typeof body.ref === "string" ? body.ref : "stash@{0}";
+            if (!/^stash@\{\d{1,3}\}$/.test(ref))
+              return { ok: false, error: "Invalid stash reference." };
+            const sub = op.slice("stash-".length);
+            const done = await run(["stash", sub, ref]);
+            return { ok: true, output: text(done) || `Stash ${sub} done.` };
+          }
+          if (op === "branch-create" || op === "branch-switch") {
+            const branch =
+              typeof body.branch === "string" ? body.branch.trim() : "";
+            if (!isSafeBranchName(branch))
+              return { ok: false, error: `Invalid branch name: ${branch}` };
+            // `switch` refuses to clobber a dirty tree on its own, which is the
+            // safe default here: no silent carry-over of the agent's edits.
+            const done = await run(
+              op === "branch-create"
+                ? ["switch", "--create", branch]
+                : ["switch", branch],
+            );
+            return { ok: true, output: text(done) || `On ${branch}.` };
+          }
+          if (op === "undo-commit") {
+            // --soft: the commit disappears, its content lands back in the
+            // working tree. The UI only offers this for unpushed commits, so
+            // it can never leave the branch needing a force-push.
+            const done = await run(["reset", "--soft", "HEAD~1"]);
+            return {
+              ok: true,
+              output:
+                text(done) ||
+                "Last commit undone; its changes are back in the working tree.",
+            };
+          }
+          if (op === "fetch") {
+            // --prune so branches deleted on the remote stop showing as
+            // upstream candidates; no working-tree side effects.
+            const done = await run(["fetch", "--prune"]);
+            return { ok: true, output: text(done) || "Already up to date." };
+          }
+          // --no-rebase merges divergent history instead of failing on git's
+          // pull.rebase prompt; --rebase replays local commits on top instead.
+          // --autostash lets either run with the agent's uncommitted work in
+          // the tree and puts it back afterwards.
+          const args =
+            op === "pull"
+              ? ["pull", "--no-rebase", "--autostash"]
+              : op === "pull-rebase"
+                ? ["pull", "--rebase", "--autostash"]
+                : ["push"];
+          const done = await run(args);
+          return { ok: true, output: text(done) };
         } catch (error) {
           return {
             ok: false,

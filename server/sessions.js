@@ -623,3 +623,100 @@ async function readResumeSession(path) {
     return null;
   }
 }
+
+/** How many of the most recent sessions a single search will open. */
+const SEARCH_SESSION_LIMIT = 80;
+/** Snippets returned per session, so one chatty session can't crowd out the rest. */
+const SEARCH_SNIPPETS_PER_SESSION = 3;
+/** Sessions returned to the UI after ranking. */
+const SEARCH_MAX_RESULTS = 25;
+
+/** Flatten a normalized history message to searchable text. */
+function messageText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content))
+    return content
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : typeof part?.text === "string"
+            ? part.text
+            : "",
+      )
+      .filter(Boolean)
+      .join(" ");
+  return typeof message?.text === "string" ? message.text : "";
+}
+
+/** A window of text around the hit, with the surrounding words kept intact. */
+function snippetAround(text, index, query, radius = 90) {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(text.length, index + query.length + radius);
+  const slice = text.slice(start, end).replace(/\s+/g, " ").trim();
+  return `${start > 0 ? "…" : ""}${slice}${end < text.length ? "…" : ""}`;
+}
+
+/**
+ * Full-text search across saved sessions for one backend.
+ *
+ * Two passes on purpose: a cheap lowercase substring test against the raw log
+ * rejects almost every file, and only the survivors are parsed into messages
+ * to build snippets. Parsing every session up front is what would make this
+ * too slow to run from a search box.
+ */
+export async function searchSessions({ query, backend = "pi" } = {}) {
+  const needle = String(query ?? "").trim().toLowerCase();
+  if (needle.length < 2)
+    return { ok: true, results: [], error: "Enter at least two characters." };
+
+  const listed = await listSessions({ backend });
+  if (!listed.ok) return { ok: false, error: listed.error, results: [] };
+
+  const sessions = [...listed.sessions]
+    .sort((left, right) => (right.modifiedAt ?? 0) - (left.modifiedAt ?? 0))
+    .slice(0, SEARCH_SESSION_LIMIT);
+
+  const results = [];
+  for (const session of sessions) {
+    let raw = "";
+    try {
+      raw = await readFile(session.path, "utf8");
+    } catch {
+      continue; // deleted between listing and reading
+    }
+    if (!raw.toLowerCase().includes(needle)) continue;
+
+    const { messages = [] } = await readSessionMessages(session.path);
+    const snippets = [];
+    for (const message of messages) {
+      const text = messageText(message);
+      const at = text.toLowerCase().indexOf(needle);
+      if (at === -1) continue;
+      snippets.push({
+        role: String(message.role ?? "assistant"),
+        text: snippetAround(text, at, needle),
+      });
+      if (snippets.length >= SEARCH_SNIPPETS_PER_SESSION) break;
+    }
+    // The raw log matched but no rendered message did — the hit is in metadata
+    // or tool payloads. Still worth surfacing the session, without a snippet.
+    results.push({
+      path: session.path,
+      name: session.name,
+      cwd: session.cwd,
+      backend: session.backend,
+      modifiedAt: session.modifiedAt,
+      messageCount: session.messageCount,
+      snippets,
+    });
+  }
+  // Sessions where a rendered message matched are far more useful than ones
+  // that only matched inside tool payloads or metadata, so they lead.
+  results.sort(
+    (left, right) =>
+      (right.snippets.length > 0 ? 1 : 0) - (left.snippets.length > 0 ? 1 : 0) ||
+      (right.modifiedAt ?? 0) - (left.modifiedAt ?? 0),
+  );
+  return { ok: true, results: results.slice(0, SEARCH_MAX_RESULTS) };
+}

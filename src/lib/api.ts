@@ -16,6 +16,13 @@ export interface ModelInfo {
   contextWindow?: number;
 }
 
+/** A prompt waiting for the running turn to finish. */
+export interface QueuedMessage {
+  id: string;
+  message: string;
+  at: number;
+}
+
 export interface SessionState {
   model: ModelInfo | null;
   thinkingLevel: string;
@@ -25,6 +32,7 @@ export interface SessionState {
   sessionName?: string;
   messageCount: number;
   pendingMessageCount: number;
+  queuedMessages?: QueuedMessage[];
 }
 
 export interface UsageWindow {
@@ -66,9 +74,16 @@ export interface ResumeSession {
 
 export interface GitChange {
   path: string;
-  status: "added" | "modified" | "deleted";
+  status: "added" | "modified" | "deleted" | "conflicted";
   additions: number;
   deletions: number;
+}
+
+export interface GitStash {
+  /** `stash@{0}` — the only form the server accepts back. */
+  ref: string;
+  label: string;
+  age: string;
 }
 
 export interface GitChangesResponse {
@@ -81,6 +96,49 @@ export interface GitChangesResponse {
   remote?: string;
   branch?: string;
   changes?: GitChange[];
+  /** False when the branch has never been pushed (no upstream to compare). */
+  upstream?: boolean;
+  /** Commits on this branch the upstream lacks, and vice versa. */
+  ahead?: number;
+  behind?: number;
+  stashes?: GitStash[];
+  /** Local branches, most recently committed first. */
+  branches?: string[];
+  /** Remote-tracking branches with no local counterpart, prefix stripped. */
+  remoteBranches?: string[];
+  /** A half-finished operation the repo is sitting in, if any. */
+  state?: "clean" | "merging" | "rebasing" | "cherry-picking" | "reverting";
+  /** Paths git still reports as unmerged. */
+  conflicts?: string[];
+}
+
+/** Every git action the UI can trigger. Mirrors GIT_WRITE_OPS on the server. */
+export type GitOp =
+  | "push"
+  | "pull"
+  | "pull-rebase"
+  | "fetch"
+  | "commit"
+  | "commit-push"
+  | "stash"
+  | "stash-apply"
+  | "stash-pop"
+  | "stash-drop"
+  | "branch-create"
+  | "branch-switch"
+  | "undo-commit"
+  | "continue"
+  | "abort";
+
+export interface GitOpOptions {
+  /** Commit message, or the stash label. */
+  message?: string;
+  /** Repo-relative paths to limit a commit or stash to. */
+  files?: string[];
+  /** Target for stash-apply/pop/drop. */
+  ref?: string;
+  /** Target for branch-create/branch-switch. */
+  branch?: string;
 }
 
 export interface SlashCommand {
@@ -109,6 +167,17 @@ export interface SessionHistoryMessage {
   [key: string]: unknown;
 }
 
+/** One session that matched a transcript search, with the lines that matched. */
+export interface SessionSearchResult {
+  path: string;
+  name: string;
+  cwd: string;
+  backend: AgentBackend;
+  modifiedAt: number;
+  messageCount: number;
+  snippets: Array<{ role: string; text: string }>;
+}
+
 export interface SessionSnapshotResponse {
   ok: boolean;
   state?: SessionState;
@@ -118,6 +187,62 @@ export interface SessionSnapshotResponse {
   restored?: boolean;
   /** Pi: worktree path for the forked session (falls back to the original cwd). */
   forkCwd?: string;
+}
+
+/** What a file rewind did, or — with dryRun — what it would do. */
+export interface RewindFilesResult {
+  canRewind?: boolean;
+  filesChanged?: string[];
+  insertions?: number;
+  deletions?: number;
+  skippedLinks?: number;
+  dryRun?: boolean;
+  error?: string;
+}
+
+/** Real context accounting, when the backend can report it. */
+export interface ContextUsageReport {
+  totalTokens: number;
+  maxTokens: number;
+  percent: number;
+  model: string;
+  autoCompactThreshold: number;
+  isAutoCompactEnabled: boolean;
+  categories: Array<{ name: string; tokens: number }>;
+}
+
+/** A hook the agent will run, flattened out of the settings tree. */
+export interface HookRow {
+  event: string;
+  matcher: string;
+  type: string;
+  command: string;
+}
+
+/** Settings as resolved by the agent, plus which file each value came from. */
+export interface AgentSettings {
+  effective: Record<string, unknown>;
+  hooks: HookRow[];
+  sources: Array<{
+    source: string;
+    settings: Record<string, unknown>;
+  }>;
+  localSettings: Record<string, unknown>;
+  files: {
+    userSettings: string;
+    projectSettings: string;
+    localSettings: string;
+  };
+}
+
+/** One MCP server as the agent sees it. */
+export interface McpServerInfo {
+  name: string;
+  status: string;
+  scope: string;
+  error: string;
+  version: string;
+  toolCount: number | null;
 }
 
 export interface SessionMutationResponse {
@@ -156,6 +281,13 @@ export interface WorkspaceListingResponse {
   error?: string;
 }
 
+/** One hit from the composer's "@" file picker. */
+export interface WorkspaceMatch {
+  path: string;
+  relativePath: string;
+  name: string;
+}
+
 export interface WorkspaceFileResponse {
   ok: boolean;
   path?: string;
@@ -171,6 +303,42 @@ export interface PiSkillInfo {
   name: string;
   description: string;
   path: string;
+}
+
+export interface DeployStep {
+  name: string;
+  ok: boolean;
+  exit: number | null;
+  signal: string | null;
+  detail: string;
+}
+
+export interface DeployRecord {
+  finishedAt?: number;
+  commit?: string | null;
+  signature?: string | null;
+}
+
+export interface DeployState extends DeployRecord {
+  status: "running" | "success" | "failed";
+  mode: "local" | "cloud";
+  startedAt?: number;
+  steps?: DeployStep[];
+  log?: string;
+  error?: string | null;
+}
+
+export interface DeployStatusResponse {
+  ok: boolean;
+  mode: "local" | "cloud";
+  head: string | null;
+  signature: string | null;
+  dirtyFiles: number | null;
+  deploying: boolean;
+  stale: boolean;
+  last: DeployState | null;
+  lastLocal: DeployRecord | null;
+  lastCloud: DeployRecord | null;
 }
 
 export interface PiExtensionInfo {
@@ -316,8 +484,40 @@ async function put<T = unknown>(url: string, body: unknown): Promise<T> {
 }
 
 export const api = {
-  health: () => get<{ ok: boolean; cwd: string }>("/api/health"),
+  health: () =>
+    get<{
+      ok: boolean;
+      cwd: string;
+      buildId?: string;
+      bootMs?: number;
+      pid?: number;
+    }>("/api/health"),
+  deployStatus: () => get<DeployStatusResponse>("/api/deploy/status"),
+  deploy: (mode: "local" | "cloud") =>
+    post<{ ok: boolean; mode?: string; error?: string }>(
+      "/api/deploy",
+      { mode },
+      10_000,
+    ),
   catalog: () => get<PiCatalogResponse>("/api/catalog"),
+  readSkill: (name: string) =>
+    get<{ ok: boolean; name?: string; source?: string; error?: string }>(
+      `/api/catalog/skill?name=${encodeURIComponent(name)}`,
+    ),
+  writeSkill: (skill: { name: string; description: string; body: string }) =>
+    request<{ ok: boolean; name?: string; path?: string; error?: string }>(
+      "/api/catalog/skill",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(skill),
+      },
+    ),
+  deleteSkill: (name: string) =>
+    request<{ ok: boolean; error?: string }>(
+      `/api/catalog/skill?name=${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
   directories: (path?: string) =>
     get<DirectoryListingResponse>(
       `/api/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
@@ -325,6 +525,10 @@ export const api = {
   workspace: (path: string) =>
     get<WorkspaceListingResponse>(
       `/api/workspace?path=${encodeURIComponent(path)}`,
+    ),
+  workspaceSearch: (root: string, q: string) =>
+    get<{ ok: boolean; matches?: WorkspaceMatch[]; error?: string }>(
+      `/api/workspace/search?root=${encodeURIComponent(root)}&q=${encodeURIComponent(q)}`,
     ),
   workspaceFile: (path: string) =>
     get<WorkspaceFileResponse>(
@@ -381,6 +585,10 @@ export const api = {
       `/api/sessions?${params}`,
     );
   },
+  searchSessions: (query: string, backend: AgentBackend) =>
+    get<{ ok: boolean; results?: SessionSearchResult[]; error?: string }>(
+      `/api/sessions/search?backend=${backend}&q=${encodeURIComponent(query)}`,
+    ),
   archiveSession: (sessionPath: string) =>
     post<SessionMutationResponse>("/api/sessions/archive", { sessionPath }),
   restoreSession: (sessionPath: string) =>
@@ -435,6 +643,16 @@ export const api = {
     if (options?.thinkingLevel) body.thinkingLevel = options.thinkingLevel;
     return post<{ ok: boolean; error?: string }>(`/api/${key}/prompt`, body);
   },
+  enqueue: (key: string, message: string, images?: ImageAttachment[]) =>
+    post<{
+      ok: boolean;
+      data?: { queued: boolean; position?: number };
+      error?: string;
+    }>(`/api/${key}/queue`, { message, ...(images ? { images } : {}) }),
+  cancelQueued: (key: string, id?: string) =>
+    post<{ ok: boolean; error?: string }>(`/api/${key}/queue-cancel`, {
+      ...(id ? { id } : {}),
+    }),
   steer: (key: string, message: string, images?: ImageAttachment[]) =>
     post<{ ok: boolean; error?: string }>(`/api/${key}/steer`, {
       message,
@@ -452,6 +670,28 @@ export const api = {
     ),
   fork: (key: string, timestamp: number) =>
     post<SessionSnapshotResponse>(`/api/${key}/fork`, { timestamp }),
+  settings: (key: string) =>
+    get<{ ok: boolean; data?: AgentSettings; error?: string }>(
+      `/api/${key}/settings`,
+    ),
+  mcpServers: (key: string) =>
+    get<{ ok: boolean; data?: { servers: McpServerInfo[] }; error?: string }>(
+      `/api/${key}/mcp`,
+    ),
+  contextUsage: (key: string) =>
+    get<{ ok: boolean; data?: ContextUsageReport; error?: string }>(
+      `/api/${key}/context`,
+    ),
+  rewindFiles: (
+    key: string,
+    timestamp: number,
+    dryRun = false,
+    context: { cwd?: string; sessionPath?: string } = {},
+  ) =>
+    post<{ ok: boolean; data?: RewindFilesResult; error?: string }>(
+      `/api/${key}/rewind-files`,
+      { timestamp, dryRun, ...context },
+    ),
   truncate: (key: string, userTimestamp: number, sessionPath?: string) =>
     post<SessionSnapshotResponse>(
       `/api/${key}/truncate`,
@@ -463,16 +703,22 @@ export const api = {
       `/api/${key}/goal`,
       { text },
     ),
-  gitRun: (key: string, cwd: string, op: "push" | "pull") =>
+  gitRun: (key: string, cwd: string, op: GitOp, options?: GitOpOptions) =>
     post<{ ok: boolean; output?: string; error?: string }>(
       `/api/${key}/git`,
-      { cwd, op },
+      { cwd, op, ...options },
       120_000,
     ),
   gitChanges: (key: string, cwd: string) =>
     get<GitChangesResponse>(
       `/api/${key}/git-changes?cwd=${encodeURIComponent(cwd)}`,
     ),
+  revertHunk: (key: string, cwd: string, file: string, hunkIndex: number) =>
+    post<{
+      ok: boolean;
+      data?: { file: string; hunkIndex: number; remaining: number };
+      error?: string;
+    }>(`/api/${key}/git-hunk`, { cwd, file, hunkIndex }),
   gitFileDiff: (key: string, cwd: string, file: string) =>
     get<{ ok: boolean; diff?: string; error?: string }>(
       `/api/${key}/git-changes?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}`,
@@ -486,10 +732,16 @@ export const api = {
     cwd: string,
     message: string,
     files?: string[],
+    push = true,
   ) =>
     post<{ ok: boolean; output?: string; error?: string }>(
       `/api/${key}/git`,
-      { cwd, op: "commit-push", message, ...(files ? { files } : {}) },
+      {
+        cwd,
+        op: push ? "commit-push" : "commit",
+        message,
+        ...(files ? { files } : {}),
+      },
       120_000,
     ),
   compact: (key: string, customInstructions?: string) =>
@@ -586,7 +838,30 @@ export function subscribeEvents(
 ): () => void {
   let source: EventSource | null = null;
   let closed = false;
+  let reconnecting = false;
   let retryTimer: number | undefined;
+  let lastMessage = Date.now();
+
+  const scheduleReconnect = () => {
+    if (closed || reconnecting) return;
+    reconnecting = true;
+    onStatus?.("reconnecting");
+    source?.close();
+    source = null;
+    retryTimer = window.setTimeout(() => {
+      reconnecting = false;
+      void connect();
+    }, 2_000);
+  };
+
+  // Staleness watchdog: EventSource.onerror never fires for a half-open
+  // connection (idle proxy, sleep/wake, dropped socket without a reset),
+  // which leaves the UI frozen on stale data until a manual refresh. The
+  // server sends a __ping event every 10s; ~3 missed beats means it is dead.
+  const watchdog = window.setInterval(() => {
+    if (closed || reconnecting) return;
+    if (Date.now() - lastMessage > 30_000) scheduleReconnect();
+  }, 5_000);
 
   const connect = async () => {
     if (closed) return;
@@ -601,27 +876,24 @@ export function subscribeEvents(
         /* cookie may already authenticate; fall through */
       }
     }
+    lastMessage = Date.now();
     source = new EventSource(url);
     source.onopen = () => onStatus?.("connected");
     source.onmessage = (message) => {
+      lastMessage = Date.now();
       try {
         onEvent(JSON.parse(message.data) as AgentEvent);
       } catch {
         /* ignore malformed */
       }
     };
-    source.onerror = () => {
-      onStatus?.("reconnecting");
-      source?.close();
-      retryTimer = window.setTimeout(() => {
-        void connect();
-      }, 2000);
-    };
+    source.onerror = scheduleReconnect;
   };
 
   void connect();
   return () => {
     closed = true;
+    window.clearInterval(watchdog);
     if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     source?.close();
   };

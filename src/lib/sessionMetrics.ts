@@ -5,6 +5,11 @@ export interface ContextUsage {
   estimatedTokens: number
   contextWindow: number
   percent: number | null
+  /** True when the backend counted the tokens instead of us guessing from characters. */
+  exact?: boolean
+  /** Token count at which the backend will auto-compact, when it reports one. */
+  autoCompactAt?: number
+  categories?: Array<{ name: string; tokens: number }>
 }
 
 /** A conservative fallback for backends that do not expose context stats. */
@@ -27,7 +32,3 @@ export function compactTokens(value: number): string {
   return String(value)
 }
 
-export function contextUsageLabel(context: ContextUsage): string {
-  if (context.percent === null) return `? of ${compactTokens(context.contextWindow)}`
-  return `${context.percent}% of ${compactTokens(context.contextWindow)}`
-}
