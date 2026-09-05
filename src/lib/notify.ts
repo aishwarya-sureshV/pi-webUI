@@ -31,12 +31,14 @@ export function registerServiceWorker(): void {
   });
 }
 
-export function notificationsSupported(): boolean {
+function notificationsSupported(): boolean {
   return typeof Notification !== "undefined";
 }
 
 /** Permission the browser has granted, independent of the user's own toggle. */
-export function notificationPermission(): NotificationPermission | "unsupported" {
+export function notificationPermission():
+  | NotificationPermission
+  | "unsupported" {
   return notificationsSupported() ? Notification.permission : "unsupported";
 }
 

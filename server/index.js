@@ -79,12 +79,7 @@ import {
   readSessionMessages,
   restoreSession,
 } from "./sessions.js";
-import {
-  deleteSkill,
-  loadCatalog,
-  readSkill,
-  writeSkill,
-} from "./catalog.js";
+import { deleteSkill, loadCatalog, readSkill, writeSkill } from "./catalog.js";
 import { listOllamaModels, syncOllamaModelsJson } from "./ollama-models.js";
 import { confinePath, defaultWorkspaceRoots } from "./workspace-paths.js";
 
@@ -193,7 +188,7 @@ function rankSearchMatches(matches, query) {
  * applies only hunk N is the header plus that hunk and nothing else — which is
  * what makes reverting a single hunk possible without touching the others.
  */
-export function splitDiffHunks(diff) {
+function splitDiffHunks(diff) {
   const lines = String(diff ?? "").split("\n");
   const header = [];
   const hunks = [];

@@ -409,7 +409,7 @@ export function apiOrigin(): string {
   return "http://127.0.0.1:4319";
 }
 
-export function apiUrl(path: string): string {
+function apiUrl(path: string): string {
   const origin = apiOrigin();
   return origin ? `${origin}${path}` : path;
 }

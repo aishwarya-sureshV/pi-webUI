@@ -1,4 +1,4 @@
-import { cloneElement, Fragment, isValidElement, type ReactNode } from 'react'
+import { cloneElement, Fragment, isValidElement, type ReactNode } from "react";
 
 /**
  * Tiny, dependency-free syntax highlighter for prose (markdown) code blocks
@@ -11,271 +11,308 @@ import { cloneElement, Fragment, isValidElement, type ReactNode } from 'react'
  */
 
 const LANG_ALIASES: Record<string, string> = {
-  javascript: 'js',
-  typescript: 'ts',
-  node: 'js',
-  py: 'python',
-  sh: 'bash',
-  shell: 'bash',
-  zsh: 'bash',
-  yml: 'yaml',
-}
+  javascript: "js",
+  typescript: "ts",
+  node: "js",
+  py: "python",
+  sh: "bash",
+  shell: "bash",
+  zsh: "bash",
+  yml: "yaml",
+};
 
 const C_LIKE = new Set([
-  'js',
-  'javascript',
-  'mjs',
-  'cjs',
-  'jsx',
-  'ts',
-  'typescript',
-  'tsx',
-  'mts',
-  'cts',
-  'json',
-  'jsonc',
-  'json5',
-  'go',
-  'rust',
-  'rs',
-  'java',
-  'c',
-  'h',
-  'cpp',
-  'cc',
-  'cxx',
-  'hpp',
-  'c++',
-  'cs',
-  'csharp',
-  'swift',
-  'kotlin',
-  'kt',
-  'scala',
-  'dart',
-  'php',
-  'groovy',
-  'less',
-  'scss',
-  'sass',
-  'php',
-])
+  "js",
+  "javascript",
+  "mjs",
+  "cjs",
+  "jsx",
+  "ts",
+  "typescript",
+  "tsx",
+  "mts",
+  "cts",
+  "json",
+  "jsonc",
+  "json5",
+  "go",
+  "rust",
+  "rs",
+  "java",
+  "c",
+  "h",
+  "cpp",
+  "cc",
+  "cxx",
+  "hpp",
+  "c++",
+  "cs",
+  "csharp",
+  "swift",
+  "kotlin",
+  "kt",
+  "scala",
+  "dart",
+  "php",
+  "groovy",
+  "less",
+  "scss",
+  "sass",
+  "php",
+]);
 
 const HASH_LANGS = new Set([
-  'python',
-  'py',
-  'rb',
-  'ruby',
-  'sh',
-  'bash',
-  'zsh',
-  'shell',
-  'shellsession',
-  'yaml',
-  'yml',
-  'toml',
-  'ini',
-  'r',
-  'perl',
-  'pl',
-  'dockerfile',
-  'makefile',
-  'make',
-  'ps1',
-  'powershell',
-  'conf',
-  'gitconfig',
-  'gitignore',
-  'dockerfile',
-])
+  "python",
+  "py",
+  "rb",
+  "ruby",
+  "sh",
+  "bash",
+  "zsh",
+  "shell",
+  "shellsession",
+  "yaml",
+  "yml",
+  "toml",
+  "ini",
+  "r",
+  "perl",
+  "pl",
+  "dockerfile",
+  "makefile",
+  "make",
+  "ps1",
+  "powershell",
+  "conf",
+  "gitconfig",
+  "gitignore",
+  "dockerfile",
+]);
 
-const DASH_LANGS = new Set(['sql', 'lua', 'haskell', 'hs', 'ada'])
-const MARKUP_LANGS = new Set(['html', 'xml', 'svg', 'vue', 'svelte', 'markdown', 'md'])
+const DASH_LANGS = new Set(["sql", "lua", "haskell", "hs", "ada"]);
+const MARKUP_LANGS = new Set([
+  "html",
+  "xml",
+  "svg",
+  "vue",
+  "svelte",
+  "markdown",
+  "md",
+]);
 
 const KEYWORDS = [
   // declarations / control flow (broad union across common languages)
-  'const',
-  'let',
-  'var',
-  'function',
-  'def',
-  'fn',
-  'func',
-  'class',
-  'struct',
-  'enum',
-  'interface',
-  'trait',
-  'impl',
-  'extends',
-  'implements',
-  'namespace',
-  'module',
-  'package',
-  'import',
-  'export',
-  'from',
-  'use',
-  'require',
-  'return',
-  'yield',
-  'if',
-  'elif',
-  'else',
-  'for',
-  'foreach',
-  'while',
-  'do',
-  'loop',
-  'switch',
-  'case',
-  'match',
-  'default',
-  'break',
-  'continue',
-  'pass',
-  'new',
-  'delete',
-  'del',
-  'async',
-  'await',
-  'try',
-  'catch',
-  'finally',
-  'throw',
-  'throws',
-  'raise',
-  'except',
-  'with',
-  'as',
-  'in',
-  'is',
-  'of',
-  'not',
-  'and',
-  'or',
-  'lambda',
-  'global',
-  'nonlocal',
-  'assert',
-  'static',
-  'final',
-  'abstract',
-  'public',
-  'private',
-  'protected',
-  'readonly',
-  'override',
-  'virtual',
-  'get',
-  'set',
-  'type',
-  'alias',
-  'typedef',
-  'infer',
-  'keyof',
-  'satisfies',
-  'declare',
-  'constructor',
-  'super',
-  'this',
-  'self',
-  'mut',
-  'pub',
-  'ref',
-  'move',
-  'dyn',
-  'where',
-  'unsafe',
-  'go',
-  'defer',
-  'chan',
-  'map',
-  'range',
-  'select',
+  "const",
+  "let",
+  "var",
+  "function",
+  "def",
+  "fn",
+  "func",
+  "class",
+  "struct",
+  "enum",
+  "interface",
+  "trait",
+  "impl",
+  "extends",
+  "implements",
+  "namespace",
+  "module",
+  "package",
+  "import",
+  "export",
+  "from",
+  "use",
+  "require",
+  "return",
+  "yield",
+  "if",
+  "elif",
+  "else",
+  "for",
+  "foreach",
+  "while",
+  "do",
+  "loop",
+  "switch",
+  "case",
+  "match",
+  "default",
+  "break",
+  "continue",
+  "pass",
+  "new",
+  "delete",
+  "del",
+  "async",
+  "await",
+  "try",
+  "catch",
+  "finally",
+  "throw",
+  "throws",
+  "raise",
+  "except",
+  "with",
+  "as",
+  "in",
+  "is",
+  "of",
+  "not",
+  "and",
+  "or",
+  "lambda",
+  "global",
+  "nonlocal",
+  "assert",
+  "static",
+  "final",
+  "abstract",
+  "public",
+  "private",
+  "protected",
+  "readonly",
+  "override",
+  "virtual",
+  "get",
+  "set",
+  "type",
+  "alias",
+  "typedef",
+  "infer",
+  "keyof",
+  "satisfies",
+  "declare",
+  "constructor",
+  "super",
+  "this",
+  "self",
+  "mut",
+  "pub",
+  "ref",
+  "move",
+  "dyn",
+  "where",
+  "unsafe",
+  "go",
+  "defer",
+  "chan",
+  "map",
+  "range",
+  "select",
   // SQL (uppercase) — kept here so they win over the generic type rule
-  'SELECT',
-  'FROM',
-  'WHERE',
-  'INSERT',
-  'INTO',
-  'UPDATE',
-  'DELETE',
-  'CREATE',
-  'TABLE',
-  'DROP',
-  'ALTER',
-  'ADD',
-  'COLUMN',
-  'VALUES',
-  'SET',
-  'JOIN',
-  'LEFT',
-  'RIGHT',
-  'INNER',
-  'OUTER',
-  'ON',
-  'GROUP',
-  'BY',
-  'ORDER',
-  'HAVING',
-  'LIMIT',
-  'OFFSET',
-  'PRIMARY',
-  'KEY',
-  'FOREIGN',
-  'REFERENCES',
-  'INDEX',
-  'UNIQUE',
-  'DISTINCT',
-  'AS',
-  'AND',
-  'OR',
-  'NOT',
-  'NULL',
-  'IS',
-]
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "INSERT",
+  "INTO",
+  "UPDATE",
+  "DELETE",
+  "CREATE",
+  "TABLE",
+  "DROP",
+  "ALTER",
+  "ADD",
+  "COLUMN",
+  "VALUES",
+  "SET",
+  "JOIN",
+  "LEFT",
+  "RIGHT",
+  "INNER",
+  "OUTER",
+  "ON",
+  "GROUP",
+  "BY",
+  "ORDER",
+  "HAVING",
+  "LIMIT",
+  "OFFSET",
+  "PRIMARY",
+  "KEY",
+  "FOREIGN",
+  "REFERENCES",
+  "INDEX",
+  "UNIQUE",
+  "DISTINCT",
+  "AS",
+  "AND",
+  "OR",
+  "NOT",
+  "NULL",
+  "IS",
+];
 
-const BOOLS = ['true', 'false', 'null', 'undefined', 'True', 'False', 'None', 'nil', 'NaN', 'Infinity']
+const BOOLS = [
+  "true",
+  "false",
+  "null",
+  "undefined",
+  "True",
+  "False",
+  "None",
+  "nil",
+  "NaN",
+  "Infinity",
+];
 
 function buildKeywordSource(words: string[]): string {
-  const sorted = [...new Set(words)].sort((a, b) => b.length - a.length)
-  return `\\b(?:${sorted.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`
+  const sorted = [...new Set(words)].sort((a, b) => b.length - a.length);
+  return `\\b(?:${sorted.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`;
 }
 
 function commentSource(lang: string | undefined): string {
-  const parts: string[] = []
-  const l = (lang ?? '').toLowerCase()
-  if (MARKUP_LANGS.has(l)) parts.push('<!--[\\s\\S]*?-->')
+  const parts: string[] = [];
+  const l = (lang ?? "").toLowerCase();
+  if (MARKUP_LANGS.has(l)) parts.push("<!--[\\s\\S]*?-->");
   // Block comments are common across C-like, css, sql, etc.
-  parts.push('/\\*[\\s\\S]*?\\*/')
-  if (C_LIKE.has(l) || ['css', 'scss', 'less', 'sass', 'go', 'rust', 'rs', 'swift', 'java', 'c', 'cpp', 'cs', 'php'].includes(l)) {
-    parts.push('//[^\\n]*')
+  parts.push("/\\*[\\s\\S]*?\\*/");
+  if (
+    C_LIKE.has(l) ||
+    [
+      "css",
+      "scss",
+      "less",
+      "sass",
+      "go",
+      "rust",
+      "rs",
+      "swift",
+      "java",
+      "c",
+      "cpp",
+      "cs",
+      "php",
+    ].includes(l)
+  ) {
+    parts.push("//[^\\n]*");
   }
-  if (HASH_LANGS.has(l)) parts.push('#[^\\n]*')
-  if (DASH_LANGS.has(l)) parts.push('--[^\\n]*')
+  if (HASH_LANGS.has(l)) parts.push("#[^\\n]*");
+  if (DASH_LANGS.has(l)) parts.push("--[^\\n]*");
   // For languages we don't recognize, allow // and # comments defensively (best-effort).
   if (!l) {
-    parts.push('//[^\\n]*')
+    parts.push("//[^\\n]*");
   }
-  return parts.join('|')
+  return parts.join("|");
 }
 
 function buildRegex(lang: string | undefined): RegExp {
-  const comment = commentSource(lang)
+  const comment = commentSource(lang);
   const string = [
     '"""[\\s\\S]*?"""',
     "'''[\\s\\S]*?'''",
-    '`(?:\\\\.|[^`\\\\])*`',
+    "`(?:\\\\.|[^`\\\\])*`",
     '"(?:\\\\.|[^"\\\\])*"',
     "'(?:\\\\.|[^'\\\\])*'",
-  ].join('|')
-  const number = '\\b0x[0-9a-fA-F]+\\b|\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b'
-  const decorator = '@[A-Za-z_]\\w*'
-  const bool = `\\b(?:${BOOLS.join('|')})\\b`
-  const keyword = buildKeywordSource(KEYWORDS)
-  const func = '[A-Za-z_$][\\w$]*(?=\\s*\\()'
-  const type = '\\b[A-Z][A-Za-z0-9_]*\\b'
+  ].join("|");
+  const number =
+    "\\b0x[0-9a-fA-F]+\\b|\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b";
+  const decorator = "@[A-Za-z_]\\w*";
+  const bool = `\\b(?:${BOOLS.join("|")})\\b`;
+  const keyword = buildKeywordSource(KEYWORDS);
+  const func = "[A-Za-z_$][\\w$]*(?=\\s*\\()";
+  const type = "\\b[A-Z][A-Za-z0-9_]*\\b";
 
   const source = [
     `(?<comment>${comment})`,
@@ -286,71 +323,87 @@ function buildRegex(lang: string | undefined): RegExp {
     `(?<keyword>${keyword})`,
     `(?<func>${func})`,
     `(?<type>${type})`,
-  ].join('|')
+  ].join("|");
 
-  return new RegExp(source, 'g')
+  return new RegExp(source, "g");
 }
 
 const TOKEN_CLASS: Record<string, string> = {
-  comment: 'agent-workbench__tok-comment',
-  string: 'agent-workbench__tok-string',
-  number: 'agent-workbench__tok-number',
-  decorator: 'agent-workbench__tok-decorator',
-  bool: 'agent-workbench__tok-bool',
-  keyword: 'agent-workbench__tok-keyword',
-  func: 'agent-workbench__tok-func',
-  type: 'agent-workbench__tok-type',
-}
+  comment: "agent-workbench__tok-comment",
+  string: "agent-workbench__tok-string",
+  number: "agent-workbench__tok-number",
+  decorator: "agent-workbench__tok-decorator",
+  bool: "agent-workbench__tok-bool",
+  keyword: "agent-workbench__tok-keyword",
+  func: "agent-workbench__tok-func",
+  type: "agent-workbench__tok-type",
+};
 
-const regexCache = new Map<string, RegExp>()
+const regexCache = new Map<string, RegExp>();
 
 function getRegex(lang: string | undefined): RegExp {
-  const key = lang ?? ''
-  let re = regexCache.get(key)
+  const key = lang ?? "";
+  let re = regexCache.get(key);
   if (!re) {
-    re = buildRegex(lang)
-    regexCache.set(key, re)
+    re = buildRegex(lang);
+    regexCache.set(key, re);
   }
-  return re
+  return re;
 }
 
 function normalizeLanguage(language: string | undefined): string | undefined {
-  if (!language) return undefined
-  const raw = language.trim().toLowerCase()
-  if (!raw || raw === 'text' || raw === 'plain' || raw === 'plaintext' || raw === 'txt') return undefined
-  return LANG_ALIASES[raw] ?? raw
+  if (!language) return undefined;
+  const raw = language.trim().toLowerCase();
+  if (
+    !raw ||
+    raw === "text" ||
+    raw === "plain" ||
+    raw === "plaintext" ||
+    raw === "txt"
+  )
+    return undefined;
+  return LANG_ALIASES[raw] ?? raw;
 }
 
 function canHighlight(language: string | undefined): boolean {
-  if (!language) return false
-  return C_LIKE.has(language)
-    || HASH_LANGS.has(language)
-    || DASH_LANGS.has(language)
-    || MARKUP_LANGS.has(language)
-    || language === 'css'
+  if (!language) return false;
+  return (
+    C_LIKE.has(language) ||
+    HASH_LANGS.has(language) ||
+    DASH_LANGS.has(language) ||
+    MARKUP_LANGS.has(language) ||
+    language === "css"
+  );
 }
 
-export function highlightCode(code: string, language: string | undefined): ReactNode[] {
-  if (!code) return []
-  const lang = normalizeLanguage(language)
-  if (!canHighlight(lang)) return [code]
-  const re = getRegex(lang)
-  re.lastIndex = 0
-  const nodes: ReactNode[] = []
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-  let key = 0
+export function highlightCode(
+  code: string,
+  language: string | undefined,
+): ReactNode[] {
+  if (!code) return [];
+  const lang = normalizeLanguage(language);
+  if (!canHighlight(lang)) return [code];
+  const re = getRegex(lang);
+  re.lastIndex = 0;
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
 
   while ((match = re.exec(code)) !== null) {
     if (match.index > lastIndex) {
-      nodes.push(<Fragment key={`t${key++}`}>{code.slice(lastIndex, match.index)}</Fragment>)
+      nodes.push(
+        <Fragment key={`t${key++}`}>
+          {code.slice(lastIndex, match.index)}
+        </Fragment>,
+      );
     }
-    const groups = match.groups ?? {}
-    let token: string | undefined
+    const groups = match.groups ?? {};
+    let token: string | undefined;
     for (const name of Object.keys(TOKEN_CLASS)) {
       if (groups[name] !== undefined) {
-        token = name
-        break
+        token = name;
+        break;
       }
     }
     if (token) {
@@ -358,59 +411,68 @@ export function highlightCode(code: string, language: string | undefined): React
         <span key={`k${key++}`} className={TOKEN_CLASS[token]}>
           {match[0]}
         </span>,
-      )
+      );
     } else {
-      nodes.push(<Fragment key={`p${key++}`}>{match[0]}</Fragment>)
+      nodes.push(<Fragment key={`p${key++}`}>{match[0]}</Fragment>);
     }
-    lastIndex = re.lastIndex
-    if (match.index === re.lastIndex) re.lastIndex++ // guard against zero-width
+    lastIndex = re.lastIndex;
+    if (match.index === re.lastIndex) re.lastIndex++; // guard against zero-width
   }
   if (lastIndex < code.length) {
-    nodes.push(<Fragment key={`t${key++}`}>{code.slice(lastIndex)}</Fragment>)
+    nodes.push(<Fragment key={`t${key++}`}>{code.slice(lastIndex)}</Fragment>);
   }
-  return nodes
+  return nodes;
 }
 
 /** Split highlighted output into one node array per source line. */
-export function splitCodeLines(nodes: ReactNode[]): ReactNode[][] {
-  return splitWithKey(nodes, { n: 0 })
+function splitCodeLines(nodes: ReactNode[]): ReactNode[][] {
+  return splitWithKey(nodes, { n: 0 });
 }
 
 function splitWithKey(nodes: ReactNode[], key: { n: number }): ReactNode[][] {
-  const lines: ReactNode[][] = [[]]
+  const lines: ReactNode[][] = [[]];
   const pushText = (text: string) => {
-    const parts = text.split('\n')
+    const parts = text.split("\n");
     parts.forEach((part, index) => {
-      if (index > 0) lines.push([])
-      if (part) lines[lines.length - 1]!.push(<Fragment key={`s${key.n++}`}>{part}</Fragment>)
-    })
-  }
+      if (index > 0) lines.push([]);
+      if (part)
+        lines[lines.length - 1]!.push(
+          <Fragment key={`s${key.n++}`}>{part}</Fragment>,
+        );
+    });
+  };
   const walk = (node: ReactNode): void => {
-    if (node === null || node === undefined || typeof node === 'boolean') return
-    if (typeof node === 'string' || typeof node === 'number') {
-      pushText(String(node))
-      return
+    if (node === null || node === undefined || typeof node === "boolean")
+      return;
+    if (typeof node === "string" || typeof node === "number") {
+      pushText(String(node));
+      return;
     }
     if (Array.isArray(node)) {
-      node.forEach(walk)
-      return
+      node.forEach(walk);
+      return;
     }
     if (isValidElement<{ children?: ReactNode }>(node)) {
-      const children = node.props.children
-      if (children === null || children === undefined) return
-      const childLines = splitWithKey(Array.isArray(children) ? children : [children], key)
+      const children = node.props.children;
+      if (children === null || children === undefined) return;
+      const childLines = splitWithKey(
+        Array.isArray(children) ? children : [children],
+        key,
+      );
       childLines.forEach((childLine, index) => {
-        if (index > 0) lines.push([])
+        if (index > 0) lines.push([]);
         if (childLine.length > 0) {
-          lines[lines.length - 1]!.push(cloneElement(node, { key: `c${key.n++}` }, childLine))
+          lines[lines.length - 1]!.push(
+            cloneElement(node, { key: `c${key.n++}` }, childLine),
+          );
         }
-      })
-      return
+      });
+      return;
     }
-    lines[lines.length - 1]!.push(node)
-  }
-  nodes.forEach(walk)
-  return lines
+    lines[lines.length - 1]!.push(node);
+  };
+  nodes.forEach(walk);
+  return lines;
 }
 
 /** Code block with a line-number gutter. `startAt` offsets numbering (diff hunks). */
@@ -421,30 +483,38 @@ export function NumberedCode({
   highlight = true,
   className,
 }: {
-  code: string
-  language?: string
-  startAt?: number
-  highlight?: boolean
-  className?: string
+  code: string;
+  language?: string;
+  startAt?: number;
+  highlight?: boolean;
+  className?: string;
 }) {
-  const source = (code ?? '').replace(/\r\n/g, '\n')
-  const rows = splitCodeLines(highlight ? highlightCode(source, language) : [source])
-  const width = String(startAt + Math.max(rows.length, 1) - 1).length
+  const source = (code ?? "").replace(/\r\n/g, "\n");
+  const rows = splitCodeLines(
+    highlight ? highlightCode(source, language) : [source],
+  );
+  const width = String(startAt + Math.max(rows.length, 1) - 1).length;
   return (
     <pre
-      className={`code-numbered${className ? ` ${className}` : ''}`}
-      {...(language ? { 'data-language': language } : {})}
+      className={`code-numbered${className ? ` ${className}` : ""}`}
+      {...(language ? { "data-language": language } : {})}
     >
       <code>
         {rows.map((row, index) => (
           <span className="code-line" key={index}>
-            <span className="code-line__no" aria-hidden="true" style={{ minWidth: `${width}ch` }}>
+            <span
+              className="code-line__no"
+              aria-hidden="true"
+              style={{ minWidth: `${width}ch` }}
+            >
               {startAt + index}
             </span>
-            <span className="code-line__text">{row.length > 0 ? row : '\u00a0'}</span>
+            <span className="code-line__text">
+              {row.length > 0 ? row : "\u00a0"}
+            </span>
           </span>
         ))}
       </code>
     </pre>
-  )
+  );
 }

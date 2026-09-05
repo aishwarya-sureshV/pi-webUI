@@ -70,7 +70,7 @@ async function listPiSessions({ archived = false } = {}) {
   }
 }
 
-export async function listClaudeSessions({ archived = false } = {}) {
+async function listClaudeSessions({ archived = false } = {}) {
   try {
     const [projects, archivedPaths] = await Promise.all([
       readdir(CLAUDE_SESSIONS_ROOT, { withFileTypes: true }),
@@ -666,7 +666,9 @@ function snippetAround(text, index, query, radius = 90) {
  * too slow to run from a search box.
  */
 export async function searchSessions({ query, backend = "pi" } = {}) {
-  const needle = String(query ?? "").trim().toLowerCase();
+  const needle = String(query ?? "")
+    .trim()
+    .toLowerCase();
   if (needle.length < 2)
     return { ok: true, results: [], error: "Enter at least two characters." };
 
@@ -715,7 +717,8 @@ export async function searchSessions({ query, backend = "pi" } = {}) {
   // that only matched inside tool payloads or metadata, so they lead.
   results.sort(
     (left, right) =>
-      (right.snippets.length > 0 ? 1 : 0) - (left.snippets.length > 0 ? 1 : 0) ||
+      (right.snippets.length > 0 ? 1 : 0) -
+        (left.snippets.length > 0 ? 1 : 0) ||
       (right.modifiedAt ?? 0) - (left.modifiedAt ?? 0),
   );
   return { ok: true, results: results.slice(0, SEARCH_MAX_RESULTS) };

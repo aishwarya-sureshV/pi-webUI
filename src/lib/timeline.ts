@@ -75,7 +75,7 @@ export function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export function readableAgentError(value: unknown): string {
+function readableAgentError(value: unknown): string {
   if (typeof value !== "string") return "";
   const raw = value.trim();
   if (!raw) return "";
@@ -95,7 +95,7 @@ export function readableAgentError(value: unknown): string {
   return raw;
 }
 
-export function extractText(value: unknown): string {
+function extractText(value: unknown): string {
   if (!Array.isArray(value)) return "";
   return value
     .map((part) => {

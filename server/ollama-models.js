@@ -27,7 +27,7 @@ const OLLAMA_THINKING_LEVEL_MAP = {
   max: "high",
 };
 
-export function modelKey(model) {
+function modelKey(model) {
   return `${String(model?.provider ?? "").toLowerCase()}\0${String(model?.id ?? "")}`;
 }
 
